@@ -622,12 +622,22 @@ const mat4 = {
         ];
     },
     fromScaling: (v) => {
-        return [
-            v[0], 0, 0, 0,
-            0, v[1], 0, 0,
-            0, 0, v[2], 0,
-            0, 0, 0, 1
-        ];
+        if (Array.isArray(v)) {
+            return [
+                v[0], 0, 0, 0,
+                0, v[1], 0, 0,
+                0, 0, v[2], 0,
+                0, 0, 0, 1
+            ];
+        }
+        else {
+            return [
+                v, 0, 0, 0,
+                0, v, 0, 0,
+                0, 0, v, 0,
+                0, 0, 0, 1
+            ];
+        }
     },
     getTranslation: (m) => {
         return [m[12], m[13], m[14]];
@@ -730,5 +740,6 @@ const mat4 = {
         }
         return true;
     }
+    // TODO: mat4.fromMat3
 };
 Object.freeze(mat4);

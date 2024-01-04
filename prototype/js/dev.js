@@ -7,7 +7,7 @@
  * All log functions of this module are removed during the final build step if
  * the DEBUG flag is set to false.
  */
-export { logInfo, logWarning, throwError, assert, shallowCopy, };
+export { assert, DEBUG, logInfo, logWarning, shallowCopy, throwError, };
 // =============================================================================
 // Logging
 // =============================================================================

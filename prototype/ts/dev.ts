@@ -9,12 +9,13 @@
  */
 export
 {
+    assert,
+    DEBUG,
     logInfo,
     logWarning,
-    throwError,
-    assert,
     shallowCopy,
-}
+    throwError,
+};
 
 
 // =============================================================================
@@ -30,7 +31,7 @@ export
 function logInfo(message: () => string): void
 {
     if (DEBUG) {
-        console.log(message())
+        console.log(message());
     }
 }
 
@@ -43,7 +44,7 @@ function logInfo(message: () => string): void
 function logWarning(message: () => string): void
 {
     if (DEBUG) {
-        console.warn(message())
+        console.warn(message());
     }
 }
 
@@ -57,10 +58,10 @@ function logWarning(message: () => string): void
 function throwError(message: () => string): never
 {
     if (DEBUG) {
-        throw new Error(message())
+        throw new Error(message());
     }
     else { // LATER: Add error ids for release mode.
-        throw new Error("An error occurred.")
+        throw new Error("An error occurred.");
     }
 }
 
@@ -73,9 +74,9 @@ function throwError(message: () => string): never
 function assert(condition: () => [boolean, string]): void
 {
     if (DEBUG) {
-        const [result, message] = condition()
+        const [result, message] = condition();
         if (!result) {
-            throw new Error(message)
+            throw new Error(message);
         }
     }
 }
@@ -90,11 +91,11 @@ function assert(condition: () => [boolean, string]): void
 function shallowCopy<T>(value: T): T
 {
     if (Array.isArray(value)) {
-        return [...value] as any
+        return [...value] as any;
     } else if (typeof value === "object") {
-        return { ...value } as any
+        return { ...value } as any;
     } else {
-        return value
+        return value;
     }
 }
 
@@ -108,7 +109,7 @@ function shallowCopy<T>(value: T): T
  * During the final (uglify) build step, this debug flag is set to false,
  * and everything within `if(DEBUG){ ... }` blocks is removed.
  */
-const DEBUG: boolean = true
+const DEBUG: boolean = true;
 
 
 // =============================================================================
@@ -121,23 +122,30 @@ declare global
     /** The Array.at method is not yet supported by TypeScript. */
     interface Array<T>
     {
-        at(index: number): T
+        at(index: number): T;
     }
 
     /** Extract the K from Map<K,V>. */
-    type KeyOf<T> = T extends Map<infer I, any> ? I : never
+    type KeyOf<T> = T extends Map<infer I, any> ? I : never;
 
     /** Extract the V from Map<K,V>. */
-    type ValueOf<T> = T extends Map<any, infer I> ? I : never
+    type ValueOf<T> = T extends Map<any, infer I> ? I : never;
 
     /** Turns a ReadonlyMap<K,V> into a Map<K,V>. */
     type MutableMap<T> = Map<
         T extends ReadonlyMap<infer I, any> ? I : never,
-        T extends ReadonlyMap<any, infer I> ? I : never>
+        T extends ReadonlyMap<any, infer I> ? I : never>;
 
     /** At least one, but can be more. Never empty. */
-    type Some<T> = [T, ...T[]]
+    type Some<T> = [T, ...T[]];
 
     /** A sequence needs at least two elements. */
-    type Sequence<T> = [T, T, ...T[]]
+    type Sequence<T> = [T, T, ...T[]];
+
+    /**
+     * A fixed-size Array type.
+     * See https://stackoverflow.com/a/52490977
+     */
+    type Tuple<T, N extends number> = N extends N ? number extends N ? T[] : _TupleOf<T, N, []> : never;
+    type _TupleOf<T, N extends number, R extends unknown[]> = R['length'] extends N ? R : _TupleOf<T, N, [T, ...R]>;
 }

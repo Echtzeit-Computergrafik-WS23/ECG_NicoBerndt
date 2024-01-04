@@ -1,9 +1,12 @@
-export { createAttributeBuffer, createDrawCall, createFragmentShader, createIndexBuffer, createShaderProgram, createTexture, createVAO, createVertexShader, defineTexture, deleteShader, getContext, performDrawCall, };
-import { AttributeDataType, ShaderStage, TextureDataTarget, TextureTarget, } from "./types.js";
-import { assert, logInfo, logWarning, throwError, } from "./dev.js";
+export { createAttributeBuffer, createDrawCall, createFragmentShader, createFramebuffer, createIndexBuffer, createRenderbuffer, createShaderProgram, createTexture, createVAO, createVertexShader, deleteShader, getContext, performDrawCall, updateFramebufferLayer, updateTexture, 
+// TODO: these should not be part of the public API per-se, but I need them
+// in the course to implement "manual" versions of the function
+setUniform, calcOffset, calcStride, getAttributeSize, };
+import { AttachmentType, AttributeDataType, CullFace, DepthTest, ShaderStage, TextureCompareFunc, TextureDataTarget, TextureFilter, TextureInternalFormat, TextureSrcDataType, TextureTarget, TextureWrap, } from "./types.js";
+import { assert, DEBUG, logInfo, logWarning, throwError, } from "./dev.js";
 import { isPowerOf2, } from './math.js';
 // TODO: ensure that all exceptions leave the WebGL state unchanged (that includes the removal of created objects)
-// TODO: make names optional?
+// TODO: use samplers? We'll need them in WebGPU anyway.
 // Context ================================================================== //
 /**
  * Get the WebGL2 context from a canvas element in the DOM.
@@ -42,9 +45,17 @@ function getContext(canvasId, options = {}) {
     if (gl == null) {
         throwError(() => `Could not acquire a WebGL2 context from canvas with id "${canvasId}"`);
     }
+    // Test various WebGL2 extensions.
+    if (gl.getExtension('EXT_color_buffer_float') == null) {
+        logWarning(() => 'EXT_color_buffer_float is not supported.');
+    }
     return gl;
 }
 // Vertex Buffers =========================================================== //
+/**
+ * @param type Attribute data type to inspect.
+ * @returns Size of the given attribute data type in bytes.
+ */
 function getAttributeDataSize(type) {
     switch (type) {
         case (AttributeDataType.BYTE):
@@ -64,20 +75,42 @@ function getAttributeDataSize(type) {
             throwError(() => `Invalid attribute data type: ${type}.`);
     }
 }
+/**
+ * @param description Description of the attribute to inspect.
+ * @returns The size of one attribute location in bytes.
+ */
+function getAttributeSize(description) {
+    return description.size * getAttributeDataSize(description.type);
+}
+/**
+ * @param description Description of the attribute to inspect.
+ * @returns The width of the attribute in bytes.
+ */
+function getAttributeWidth(description) {
+    return getAttributeSize(description) * (description.width ?? 1);
+}
+/**
+ * @param attributes A list of attributes in a buffer.
+ * @returns The stride of the buffer in bytes.
+ */
 function calcStride(attributes) {
     let stride = 0;
-    for (const attribute of attributes) {
-        stride += attribute.size * getAttributeDataSize(attribute.type);
+    for (const description of attributes) {
+        stride += getAttributeWidth(description);
     }
     return stride;
 }
+/**
+ * @param attribute The attribute to inspect.
+ * @returns The offset of the attribute in the buffer in bytes.
+ */
 function calcOffset(attribute) {
     let offset = 0;
     for (const [name, description] of attribute.buffer.attributes) {
         if (name === attribute.name) {
             return offset;
         }
-        offset += description.size * getAttributeDataSize(description.type);
+        offset += getAttributeWidth(description);
     }
     return null;
 }
@@ -91,11 +124,11 @@ function calcOffset(attribute) {
  */
 function createAttributeBuffer(gl, name, data, attributes, options = {}) {
     // Ensure that the buffer contents are plausible for the given attributes.
-    assert(() => [data.length > 0, `Data for Attribute Buffer "${name}" must not be empty.`]);
+    assert(() => [data.length > 0, `The data for Attribute Buffer "${name}" must not be empty.`]);
     const attributeDescriptions = Object.values(attributes);
     assert(() => [attributeDescriptions.length > 0, `Attribute Buffer "${name}" must have at least one attribute.`]);
     const stride = calcStride(attributeDescriptions) / 4; // stride is in bytes, data is in floats
-    assert(() => [data.length % stride === 0, `Data length for Attribute Buffer "${name}" must be a multiple of the stride.`]);
+    assert(() => [data.length % stride === 0, `The size of the data for Attribute Buffer "${name}" must be a multiple of its stride. Size is ${data.length}, stride is ${stride}.`]);
     // Create the VBO.
     const vbo = gl.createBuffer();
     if (vbo === null) {
@@ -109,7 +142,7 @@ function createAttributeBuffer(gl, name, data, attributes, options = {}) {
     // Crate the Attribute Buffer Object.
     return {
         name: name,
-        glBuffer: vbo,
+        glObject: vbo,
         size: data.length / stride,
         attributes: new Map(Object.entries(attributes)),
     };
@@ -171,7 +204,7 @@ function createIndexBuffer(gl, indices, options = {}) {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
     // Return the buffer information.
     return {
-        glBuffer,
+        glObject: glBuffer,
         type,
         size: indices.length,
     };
@@ -192,24 +225,28 @@ function createVAO(gl, name, ibo, attributes) {
     }
     gl.bindVertexArray(vao);
     // Bind the index buffer to the VAO.
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo.glBuffer);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo.glObject);
     // Bind the attribute buffers to the VAO.
-    for (const [location, attrRef] of attributes) {
+    for (const [location, attrRef] of attributes.entries()) {
         const offset = calcOffset(attrRef);
         if (offset === null) {
             throwError(() => `Could not find VAO attribute for location ${location} in Attribute Buffer "${attrRef.buffer.name}".`);
         }
         const attributeName = attrRef.name;
-        const attributebuffer = attrRef.buffer;
-        const definition = attributebuffer.attributes.get(attributeName);
+        const attributeBuffer = attrRef.buffer;
+        const bufferStride = calcStride(attributeBuffer.attributes.values());
+        const definition = attributeBuffer.attributes.get(attributeName);
         if (definition === undefined) {
-            throwError(() => `Could not find VAO attribute for location ${location} in Attribute Buffer "${attributebuffer.name}".`);
+            throwError(() => `Could not find VAO attribute for location ${location} in Attribute Buffer "${attributeBuffer.name}".`);
         }
-        gl.bindBuffer(gl.ARRAY_BUFFER, attributebuffer.glBuffer);
-        gl.enableVertexAttribArray(location);
-        gl.vertexAttribPointer(location, definition.size, definition.type, definition.normalized ?? false, calcStride(attributebuffer.attributes.values()), offset);
+        const attributeSize = getAttributeSize(definition);
+        gl.bindBuffer(gl.ARRAY_BUFFER, attributeBuffer.glObject);
+        for (let locationOffset = 0; locationOffset < (definition.width ?? 1); ++locationOffset) {
+            gl.enableVertexAttribArray(location + locationOffset);
+            gl.vertexAttribPointer(location + locationOffset, definition.size, definition.type, definition.normalized ?? false, bufferStride, offset + (locationOffset * attributeSize));
+            gl.vertexAttribDivisor(location + locationOffset, definition.divisor ?? 0);
+        }
         logInfo(() => `Attribute "${attributeName}" of VAO "${name}" bound to location: ${location}`);
-        // TODO: this does not handle the case where the attribute type is a matrix, see https://stackoverflow.com/a/17355139
     }
     // Reset the WebGL state again.
     gl.bindBuffer(gl.ARRAY_BUFFER, null);
@@ -218,209 +255,498 @@ function createVAO(gl, name, ibo, attributes) {
     // Return the VAO object.
     return {
         name,
-        glVao: vao,
+        glObject: vao,
         ibo,
         attributes,
     };
 }
-function textureDataTargetToTarget(dataTarget) {
-    switch (dataTarget) {
-        case TextureDataTarget.TEXTURE_2D:
-            return TextureTarget.TEXTURE_2D;
-        case TextureDataTarget.TEXTURE_3D:
-            return TextureTarget.TEXTURE_3D;
-        case TextureDataTarget.TEXTURE_2D_ARRAY:
-            return TextureTarget.TEXTURE_2D_ARRAY;
-        case TextureDataTarget.TEXTURE_CUBE_MAP_POSITIVE_X:
-        case TextureDataTarget.TEXTURE_CUBE_MAP_NEGATIVE_X:
-        case TextureDataTarget.TEXTURE_CUBE_MAP_POSITIVE_Y:
-        case TextureDataTarget.TEXTURE_CUBE_MAP_NEGATIVE_Y:
-        case TextureDataTarget.TEXTURE_CUBE_MAP_POSITIVE_Z:
-        case TextureDataTarget.TEXTURE_CUBE_MAP_NEGATIVE_Z:
-            return TextureTarget.TEXTURE_CUBE_MAP;
-        default:
-            throwError(() => `Invalid texture data target: ${dataTarget}.`);
-    }
-}
-function defineTextureImpl(gl, glTexture, dataTarget, source, options = {}) {
-    // Get some information about the WebGL context.
-    const textureUnitCount = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS);
-    const anisotropyExtension = gl.getExtension("EXT_texture_filter_anisotropic");
-    const maxAnisotropy = anisotropyExtension ? gl.getParameter(anisotropyExtension.MAX_TEXTURE_MAX_ANISOTROPY_EXT) : 0;
-    // Validate the arguments and apply default values.
-    let width = Math.max(1, Math.ceil(options.width ?? 1));
-    let height = Math.max(1, Math.ceil(options.height ?? 1));
-    const depth = Math.max(1, Math.ceil(options.depth ?? 1));
-    // TODO: check that width, height and depth make sense with the given source
-    const level = Math.max(0, Math.ceil(options.level ?? 0));
-    const internalFormat = options.internalFormat ?? gl.RGB;
-    const sourceFormat = options.sourceFormat ?? gl.RGB;
-    const dataType = options.dataType ?? gl.UNSIGNED_BYTE;
-    // TODO: validate formats and data types
-    // TODO: There should be some sort of automatic decision tree that determines the correct
-    // combination of internal format / format and type based on some human-understandable description.
-    // Have a look at:
-    // * https://developer.mozilla.org/en-US/docs/Web/API/WebGLRenderingContext/texImage2D
-    // * https://registry.khronos.org/webgl/specs/latest/2.0/#TEXTURE_TYPES_FORMATS_FROM_DOM_ELEMENTS_TABLE
-    const wipTextureUnit = options.wipTextureUnit ?? textureUnitCount - 1; // use the highest texture unit by default
-    if (wipTextureUnit < 0 || wipTextureUnit >= textureUnitCount) {
-        throwError(() => `Invalid WIP texture unit: ${options.wipTextureUnit}.`);
-    }
-    const createMipMaps = options.createMipMaps ?? true;
-    const setAnisotropy = anisotropyExtension ? (options.setAnisotropy ?? true) : false;
-    // Use a default source of one black pixel if it is null
-    const placeholder = new Uint8Array([0, 0, 0, 255]);
-    if (source === null) {
-        if (level !== 0) {
-            throwError(() => `Level must be zero for empty textures, not ${level}.`);
-        }
-        width = 1;
-        height = 1;
-        source = placeholder;
-    }
-    // Helper functions
-    const defineTexture2D = (dataTarget, data) => {
-        if (ArrayBuffer.isView(data)) {
-            gl.texImage2D(dataTarget, level, internalFormat, width, height, 
-            /*border=*/ 0, sourceFormat, dataType, data);
-        }
-        else {
-            gl.texImage2D(dataTarget, level, internalFormat, sourceFormat, dataType, data);
-        }
-        // Define texture parameters for a 2D texture.
-        if (dataTarget === TextureDataTarget.TEXTURE_2D) {
-            // Set defaults fist
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            // Generate mipmaps if requested and possible.
-            if (createMipMaps) {
-                if (isPowerOf2(width) && isPowerOf2(height)) {
-                    gl.generateMipmap(gl.TEXTURE_2D);
-                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-                }
-                else {
-                    logWarning(() => 'Mipmaps are only supported for textures with power-of-two dimensions.');
-                }
-            }
-            // Enable anisotropic filtering if supported and requested.
-            if (setAnisotropy) {
-                if (anisotropyExtension !== null) {
-                    gl.texParameterf(gl.TEXTURE_2D, anisotropyExtension.TEXTURE_MAX_ANISOTROPY_EXT, maxAnisotropy);
-                }
-                else {
-                    logWarning(() => 'Anisotropic filtering is not supported.');
-                }
-            }
-            // TODO: customize filtering
-            // TODO: customize wrapping
-        }
-        // Define texture parameteres for a cubemap face.
-        else {
-            if (createMipMaps) {
-                logWarning(() => 'Mipmaps are not supported for cube map textures.');
-            }
-            if (setAnisotropy) {
-                logWarning(() => 'Anisotropic filtering is not supported for cube map textures.');
-            }
-            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-        }
-    };
-    const defineTexture3D = (dataTarget, data) => {
-        gl.texImage3D(dataTarget, level, internalFormat, width, height, depth, 
-        /*border=*/ 0, sourceFormat, dataType, data);
-        // TODO: 2D Array Textures?
-    };
-    // Define the texture
-    gl.activeTexture(gl.TEXTURE0 + wipTextureUnit);
-    const target = textureDataTargetToTarget(dataTarget);
-    gl.bindTexture(target, glTexture);
-    try {
-        switch (target) {
-            case TextureTarget.TEXTURE_2D:
-            case TextureTarget.TEXTURE_CUBE_MAP:
-                defineTexture2D(dataTarget, source);
-                break;
-            case TextureTarget.TEXTURE_3D:
-            case TextureTarget.TEXTURE_2D_ARRAY:
-                defineTexture3D(dataTarget, source);
-                break;
-        }
-    }
-    finally {
-        gl.bindTexture(target, null);
-    }
-}
 /**
- * (Re-)define an existing texture.
- * @param gl The WebGL context.
- * @param texture The texture object to define.
- * @param source The pixel or image data, defaults to one black pixel.
- * @param dataTarget The texture data target, required only for cube map faces.
- * @param options Additional options for the texture.
+ * Determines the WIP texture unit.
+ * By default, we are using the highest texture unit available, in order to
+ * avoid conflicts with user-defined textures.
+ * If an explicit texture unit is given, it is validated and returned.
  */
-function defineTexture(gl, texture, source = null, dataTarget = null, options = {}) {
-    // When defining cubemap faces, the data target must be specified.
-    dataTarget = dataTarget ?? texture.target;
-    if (dataTarget === TextureTarget.TEXTURE_CUBE_MAP) {
-        throwError(() => `You need to specify the data target for cube map textures.`);
+function getWIPTextureUnit(gl, givenUnit) {
+    const textureUnitCount = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS);
+    if (givenUnit === undefined) {
+        return textureUnitCount - 1;
     }
-    try {
-        defineTextureImpl(gl, texture.glTexture, dataTarget, source, options);
-        if (source === null) {
-            logInfo(() => `Defined empty texture "${texture.name}".`);
+    else {
+        if (givenUnit < 0) {
+            throwError(() => `WIP texture unit cannot be negative, got: ${givenUnit}.`);
         }
-        else if (ArrayBuffer.isView(source)) {
-            logInfo(() => `Defined texture "${texture.name}" from a data view.`);
+        if (givenUnit >= textureUnitCount) {
+            throwError(() => `Invalid WIP texture unit: ${givenUnit}, maximal texture unit available is ${textureUnitCount - 1}.`);
         }
-        else {
-            logInfo(() => `Defined texture "${texture.name}" with image data.`);
-        }
-    }
-    catch (error) {
-        error.message = `Failed to define texture "${texture.name}": ${error.message}`;
-        throw error;
+        return givenUnit;
     }
 }
 /**
- * Create and define a new texture.
+ * Given a TypedArray, this function returns the corresponding default texture source data type.
+ */
+function getDefaultSrcDataType(data) {
+    if (data instanceof Uint8Array) {
+        return TextureSrcDataType.UNSIGNED_BYTE;
+    }
+    else if (data instanceof Uint16Array) {
+        return TextureSrcDataType.UNSIGNED_SHORT;
+    }
+    else if (data instanceof Uint32Array) {
+        return TextureSrcDataType.UNSIGNED_INT;
+    }
+    else if (data instanceof Float32Array) {
+        return TextureSrcDataType.FLOAT;
+    }
+    else if (data instanceof Int8Array || data instanceof Int16Array || data instanceof Int32Array) {
+        throwError(() => `Signed integer buffers are not supported when defining a texture.`);
+    }
+    else {
+        throwError(() => `Invalid data type: ${data.constructor.name}.`);
+    }
+}
+/**
+ * There exist a strict set of rules for which source data types are allowed for which internal formats.
+ * See https://registry.khronos.org/webgl/specs/latest/2.0/#3.7.6
+ * @param data Data to define the texture with.
+ * @param srcDataType Explicitly given source data type.
+ */
+function validateSrcDataType(data, srcDataType) {
+    if (data instanceof Uint8Array) {
+        if (srcDataType !== TextureSrcDataType.UNSIGNED_BYTE) {
+            throwError(() => `When defining a texture with a 'Uint8Array', the source data type must be 'UNSIGNED_BYTE'`);
+        }
+    }
+    else if (data instanceof Uint8ClampedArray) {
+        if (srcDataType !== TextureSrcDataType.UNSIGNED_BYTE) {
+            throwError(() => `When defining a texture with a 'Uint8ClampedArray'source data type must be 'UNSIGNED_BYTE'`);
+        }
+    }
+    else if (data instanceof Float32Array) {
+        if (srcDataType !== TextureSrcDataType.FLOAT) {
+            throwError(() => `When defining a texture with a 'Float32Array', the source data type must be 'FLOAT'`);
+        }
+    }
+    else if (data instanceof Uint16Array) {
+        if (![
+            TextureSrcDataType.UNSIGNED_SHORT,
+            TextureSrcDataType.UNSIGNED_SHORT_5_6_5,
+            TextureSrcDataType.UNSIGNED_SHORT_5_5_5_1,
+            TextureSrcDataType.UNSIGNED_SHORT_4_4_4_4,
+            TextureSrcDataType.HALF_FLOAT,
+        ].includes(srcDataType)) {
+            throwError(() => `When defining a texture with a 'Uint16Array', the source data type must be one of 'UNSIGNED_SHORT', 'UNSIGNED_SHORT_5_6_5', 'UNSIGNED_SHORT_5_5_5_1', 'UNSIGNED_SHORT_4_4_4_4', or 'HALF_FLOAT'`);
+        }
+    }
+    else if (data instanceof Uint32Array) {
+        if (![
+            TextureSrcDataType.UNSIGNED_INT,
+            TextureSrcDataType.UNSIGNED_INT_5_9_9_9_REV,
+            TextureSrcDataType.UNSIGNED_INT_2_10_10_10_REV,
+            TextureSrcDataType.UNSIGNED_INT_10F_11F_11F_REV,
+            TextureSrcDataType.UNSIGNED_INT_24_8,
+        ].includes(srcDataType)) {
+            throwError(() => `When defining a texture with a 'Uint32Array', the source data type must be one of 'UNSIGNED_INT', 'UNSIGNED_INT_5_9_9_9_REV', 'UNSIGNED_INT_2_10_10_10_REV', 'UNSIGNED_INT_10F_11F_11F_REV', or'UNSIGNED_INT_24_8'`);
+        }
+    }
+    else if (data instanceof Int8Array || data instanceof Int16Array || data instanceof Int32Array) {
+        throwError(() => `Signed integer buffers are not supported when defining a texture.`);
+    }
+    else {
+        throwError(() => `Invalid data type for texture: ${data.constructor.name}`);
+    }
+}
+/**
+ * Given the internal format of a texture, and a source data type, this function returns whether the combination is valid, based on the WebGL specification.
+ * See https://registry.khronos.org/webgl/specs/latest/2.0/#TEXTURE_TYPES_FORMATS_FROM_DOM_ELEMENTS_TABLE
+ */
+function matchInternalFormatAndDataType(internalFormat, dataType) {
+    switch (internalFormat) {
+        case TextureInternalFormat.R8:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.R16F:
+            return [TextureSrcDataType.HALF_FLOAT, TextureSrcDataType.FLOAT].includes(dataType);
+        case TextureInternalFormat.R32F:
+            return dataType == TextureSrcDataType.FLOAT;
+        case TextureInternalFormat.R8UI:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.RG8:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.RG16F:
+            return [TextureSrcDataType.HALF_FLOAT, TextureSrcDataType.FLOAT].includes(dataType);
+        case TextureInternalFormat.RG32F:
+            return dataType == TextureSrcDataType.FLOAT;
+        case TextureInternalFormat.RG8UI:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.RGB8:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.SRGB8:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.RGB565:
+            return [TextureSrcDataType.UNSIGNED_BYTE, TextureSrcDataType.UNSIGNED_SHORT_5_6_5].includes(dataType);
+        case TextureInternalFormat.R11F_G11F_B10F:
+            return [TextureSrcDataType.UNSIGNED_INT_10F_11F_11F_REV, TextureSrcDataType.HALF_FLOAT, TextureSrcDataType.FLOAT].includes(dataType);
+        case TextureInternalFormat.RGB9_E5:
+            return [TextureSrcDataType.HALF_FLOAT, TextureSrcDataType.FLOAT].includes(dataType);
+        case TextureInternalFormat.RGB16F:
+            return [TextureSrcDataType.HALF_FLOAT, TextureSrcDataType.FLOAT].includes(dataType);
+        case TextureInternalFormat.RGB32F:
+            return dataType == TextureSrcDataType.FLOAT;
+        case TextureInternalFormat.RGB8UI:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.RGBA8:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.SRGB8_ALPHA8:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.RGB5_A1:
+            return [TextureSrcDataType.UNSIGNED_BYTE, TextureSrcDataType.UNSIGNED_SHORT_5_5_5_1].includes(dataType);
+        case TextureInternalFormat.RGB10_A2:
+            return dataType === TextureSrcDataType.UNSIGNED_INT_2_10_10_10_REV;
+        case TextureInternalFormat.RGBA4:
+            return [TextureSrcDataType.UNSIGNED_BYTE, TextureSrcDataType.UNSIGNED_SHORT_4_4_4_4].includes(dataType);
+        case TextureInternalFormat.RGBA16F:
+            return [TextureSrcDataType.HALF_FLOAT, TextureSrcDataType.FLOAT].includes(dataType);
+        case TextureInternalFormat.RGBA32F:
+            return dataType == TextureSrcDataType.FLOAT;
+        case TextureInternalFormat.RGBA8UI:
+            return dataType === TextureSrcDataType.UNSIGNED_BYTE;
+        case TextureInternalFormat.DEPTH_COMPONENT16:
+            return dataType === TextureSrcDataType.UNSIGNED_SHORT;
+        case TextureInternalFormat.DEPTH_COMPONENT24:
+            return dataType === TextureSrcDataType.UNSIGNED_INT;
+        case TextureInternalFormat.DEPTH_COMPONENT32F:
+            return dataType === TextureSrcDataType.FLOAT;
+    }
+    return false;
+}
+/**
+ * Determine the `format` argument for `texImage2D` based on the given internal format.
+ * See https://registry.khronos.org/webgl/specs/latest/2.0/#TEXTURE_TYPES_FORMATS_FROM_DOM_ELEMENTS_TABLE
+ */
+function getTextureFormat(gl, internalFormat) {
+    switch (internalFormat) {
+        case TextureInternalFormat.R8:
+            return gl.RED;
+        case TextureInternalFormat.R16F:
+            return gl.RED;
+        case TextureInternalFormat.R32F:
+            return gl.RED;
+        case TextureInternalFormat.R8UI:
+            return gl.RED_INTEGER;
+        case TextureInternalFormat.RG8:
+            return gl.RG;
+        case TextureInternalFormat.RG16F:
+            return gl.RG;
+        case TextureInternalFormat.RG32F:
+            return gl.RG;
+        case TextureInternalFormat.RG8UI:
+            return gl.RG_INTEGER;
+        case TextureInternalFormat.RGB8:
+            return gl.RGB;
+        case TextureInternalFormat.SRGB8:
+            return gl.RGB;
+        case TextureInternalFormat.RGB565:
+            return gl.RGB;
+        case TextureInternalFormat.R11F_G11F_B10F:
+            return gl.RGB;
+        case TextureInternalFormat.RGB9_E5:
+            return gl.RGB;
+        case TextureInternalFormat.RGB16F:
+            return gl.RGB;
+        case TextureInternalFormat.RGB32F:
+            return gl.RGB;
+        case TextureInternalFormat.RGB8UI:
+            return gl.RGB_INTEGER;
+        case TextureInternalFormat.RGBA8:
+            return gl.RGBA;
+        case TextureInternalFormat.SRGB8_ALPHA8:
+            return gl.RGBA;
+        case TextureInternalFormat.RGB5_A1:
+            return gl.RGBA;
+        case TextureInternalFormat.RGB10_A2:
+            return gl.RGBA;
+        case TextureInternalFormat.RGBA4:
+            return gl.RGBA;
+        case TextureInternalFormat.RGBA16F:
+            return gl.RGBA;
+        case TextureInternalFormat.RGBA32F:
+            return gl.RGBA;
+        case TextureInternalFormat.RGBA8UI:
+            return gl.RGBA_INTEGER;
+        case TextureInternalFormat.DEPTH_COMPONENT16:
+        case TextureInternalFormat.DEPTH_COMPONENT24:
+        case TextureInternalFormat.DEPTH_COMPONENT32F:
+            return gl.DEPTH_COMPONENT;
+        default:
+            throwError(() => `Invalid internal format: ${internalFormat}.`);
+    }
+}
+/** Get the name of the texture kind for logging. */
+function getTextureKind(target) {
+    switch (target) {
+        case TextureTarget.TEXTURE_2D: return "2D";
+        case TextureTarget.TEXTURE_3D: return "3D";
+        case TextureTarget.TEXTURE_CUBE_MAP: return "cubemap";
+        case TextureTarget.TEXTURE_2D_ARRAY: return "2D array";
+    }
+}
+/**
+ * Tests if the given internal Format is a Depth format.
+ * As per https://registry.khronos.org/OpenGL-Refpages/gl4/html/glTexParameter.xhtml
+ * (under GL_TEXTURE_COMPARE_MODE), this includes any format beginning with
+ * `DEPTH_COMPONENT_`.
+ */
+function isDepthFormat(internalFormat) {
+    switch (internalFormat) {
+        case TextureInternalFormat.DEPTH_COMPONENT16:
+        case TextureInternalFormat.DEPTH_COMPONENT24:
+        case TextureInternalFormat.DEPTH_COMPONENT32F:
+            return true;
+        default:
+            return false;
+    }
+}
+/**
+ * Checks, if a given internal format is a floating point format.
+ */
+function isFloatFormat(internalFormat) {
+    switch (internalFormat) {
+        case TextureInternalFormat.R16F:
+        case TextureInternalFormat.R32F:
+        case TextureInternalFormat.RG16F:
+        case TextureInternalFormat.RG32F:
+        case TextureInternalFormat.RGB16F:
+        case TextureInternalFormat.RGB32F:
+        case TextureInternalFormat.RGBA16F:
+        case TextureInternalFormat.RGBA32F:
+        case TextureInternalFormat.DEPTH_COMPONENT32F:
+            return true;
+        default:
+            return false;
+    }
+}
+/**
+ * Creates a new (empty) texture object.
+ * Afterwards, you will need to call `updateTexture` to fill it with data.
  * @param gl The WebGL context.
  * @param name The name of the texture.
- * @param target The texture target.
- * @param source The pixel or image data, defaults to one black pixel.
- * @param options Additional options for the texture.
+ * @param width The width of the texture, must be larger than zero.
+ * @param height The height of the texture, must be larger than zero.
+ * @param target The texture target, defaults to `TEXTURE_2D`.
+ * @param depth The depth of the texture, defaults to `null` for 2D and cubemap textures.
+ * @param options Additional options for the texture:
+ * - `useAnisotropy`: Whether to enable anisotropic filtering. Defaults to `false`.
+ * - `wipTextureUnit`: The texture unit to use for the WIP texture. Defaults to the highest texture unit available.
+ * - `internalFormat`: The internal format of the texture. Defaults to `RGBA8`.
+ * - `levels`: The number of mipmap levels to create. Defaults to the maximum possible number of levels.
+ * - `filter`: The texture (min/mag) filter(s) to use. Defaults to (tri-)linear filtering.
+ * - `wrap`: The texture wrap mode(s) to use. Defaults to `CLAMP_TO_EDGE`.
+ * - `compareFunc`: The comparison function to use for depth textures. Defaults to `NONE`.
  * @returns The texture object.
  */
-function createTexture(gl, name, target = TextureTarget.TEXTURE_2D, source = null, options = {}) {
+function createTexture(gl, name, width, height, target = TextureTarget.TEXTURE_2D, depth = null, options = {}) {
+    const kind = getTextureKind(target);
+    // Validate the dimensions of the texture.
+    if (target == TextureTarget.TEXTURE_2D || target == TextureTarget.TEXTURE_CUBE_MAP) {
+        if (depth !== null) {
+            logWarning(() => `Ignoring given depth ${depth} of ${kind} texture "${name}".`);
+            depth = null;
+        }
+        if (width < 1 || height < 1 || !Number.isSafeInteger(width) || !Number.isSafeInteger(height)) {
+            throwError(() => `Invalid texture dimensions: ${width}x${height} of ${kind} texture "${name}".`);
+        }
+    }
+    else {
+        if (depth === null) {
+            throwError(() => `Missing depth for ${kind} texture "${name}".`);
+        }
+        if (width < 1 || height < 1 || depth < 1 || !Number.isSafeInteger(width) || !Number.isSafeInteger(height) || !Number.isSafeInteger(depth)) {
+            throwError(() => `Invalid texture dimensions: ${width}x${height}x${depth} of ${kind} texture "${name}".`);
+        }
+    }
+    // Use the highest texture unit as the WIP unit by default.
+    options.wipTextureUnit = getWIPTextureUnit(gl, options.wipTextureUnit);
+    // Determine the number of levels to create.
+    if (!isPowerOf2(width)) {
+        if (options.levels !== undefined) {
+            logWarning(() => `Ignoring given number of levels for ${kind} texture "${name}" because its width is not a power of two.`);
+        }
+        options.levels = 1;
+    }
+    else if (!isPowerOf2(height)) {
+        if (options.levels !== undefined) {
+            logWarning(() => `Ignoring given number of levels for ${kind} texture "${name}" because its height is not a power of two.`);
+        }
+        options.levels = 1;
+    }
+    else if (depth !== null && !isPowerOf2(depth)) {
+        if (options.levels !== undefined) {
+            logWarning(() => `Ignoring given number of levels for ${kind} texture "${name}" because its depth is not a power of two.`);
+        }
+        // TODO: I thought WebGL2 can handle non-power-of-two MIP maps?
+        options.levels = 1;
+    }
+    else {
+        const maxLevelCount = Math.floor(Math.log2(Math.max(width, height, depth ?? 1))) + 1;
+        if (options.levels === undefined) {
+            options.levels = maxLevelCount;
+        }
+        else {
+            if (options.levels < 1 || !Number.isSafeInteger(options.levels)) {
+                throwError(() => `Invalid number of levels for ${kind} texture "${name}": ${options.levels}.`);
+            }
+            else if (options.levels > maxLevelCount) {
+                logWarning(() => `Ignoring given number of levels for ${kind} texture "${name}" because ${options.levels} is larger than the maximum possible number of levels ${maxLevelCount}.`);
+                options.levels = maxLevelCount;
+            }
+        }
+    }
+    // Determine the internal format of the texture.
+    options.internalFormat = options.internalFormat ?? gl.RGBA8;
+    // Check if anisotropic filtering is supported.
+    const anisotropyExtension = options.useAnisotropy ? gl.getExtension("EXT_texture_filter_anisotropic") : null;
+    if (options.useAnisotropy === true && anisotropyExtension === null) {
+        logWarning(() => 'Anisotropic filtering is not supported.');
+    }
+    // Comparison functions are only supported for depth textures.
+    if (options.compareFunc ?? TextureCompareFunc.NONE !== TextureCompareFunc.NONE) {
+        if (!isDepthFormat(options.internalFormat)) {
+            logWarning(() => `Ignoring given comparison function for ${kind} texture "${name}" because it is not a depth texture.`);
+            options.compareFunc = undefined;
+        }
+    }
     // Create the new texture
     const glTexture = gl.createTexture();
     if (glTexture === null) {
-        throwError(() => `Failed to create WebGL texture for Texture "${name}"`);
+        throwError(() => `Failed to create WebGL texture for ${kind} texture "${name}"`);
     }
     // Define the texture
     try {
-        const isCubemap = target === TextureTarget.TEXTURE_CUBE_MAP;
-        if (isCubemap) {
-            for (let i = 0; i < 6; ++i) {
-                defineTextureImpl(gl, glTexture, TextureDataTarget.TEXTURE_CUBE_MAP_POSITIVE_X + i, source, options);
+        gl.activeTexture(gl.TEXTURE0 + options.wipTextureUnit);
+        gl.bindTexture(target, glTexture);
+        // 2D and Cube Map textures
+        if (depth === null) {
+            gl.texStorage2D(target, options.levels, options.internalFormat, width, height);
+            // It is perfectly valid to create a texture with a non-zero size but without any data.
+            // Firefox however produces a warning: "Tex ... is incurring lazy initialization." when doing so.
+            // Which, apparently, is correct but not actually an issue because the "fix" would be worse
+            // than the problem. See:
+            //  https://stackoverflow.com/a/57734917
+            // Still, I am developing on Firefox and I don't want to see warnings in the console, so glance
+            // will create a zeroed-out data array explicitly - but only in debug mode.
+            if (DEBUG) { // TODO: test that this code is properly removed in production builds
+                if (options.internalFormat === TextureInternalFormat.RGBA8) {
+                    if (target === TextureTarget.TEXTURE_2D) {
+                        gl.texSubImage2D(target, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(width * height * 4));
+                    }
+                    else {
+                        for (let i = 0; i < 6; ++i) {
+                            gl.texSubImage2D(gl.TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(width * height * 4));
+                        }
+                    }
+                    if (options.levels > 1) {
+                        gl.generateMipmap(target);
+                    }
+                }
+            }
+            // Enable depth texture comparison if requested.
+            if (options.compareFunc ?? TextureCompareFunc.NONE !== TextureCompareFunc.NONE) {
+                gl.texParameteri(target, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+                gl.texParameteri(target, gl.TEXTURE_COMPARE_FUNC, options.compareFunc);
+            }
+        }
+        // 3D and 2D Array textures
+        else {
+            gl.texStorage3D(target, options.levels, options.internalFormat, width, height, depth);
+        }
+        logInfo(() => `Created ${kind} texture "${name}".`);
+        // Define the min- and magnification filter.
+        let minFilter;
+        let magFilter;
+        if (options.filter === undefined) {
+            if (options.levels > 1) {
+                minFilter = TextureFilter.LINEAR_MIPMAP_LINEAR;
+            }
+            else {
+                minFilter = TextureFilter.LINEAR;
+            }
+            magFilter = TextureFilter.LINEAR;
+        }
+        else if (Array.isArray(options.filter)) {
+            minFilter = options.filter[0];
+            magFilter = options.filter[1];
+        }
+        else {
+            minFilter = options.filter;
+            magFilter = options.filter;
+        }
+        if (options.levels === 1) {
+            if (![TextureFilter.NEAREST, TextureFilter.LINEAR].includes(minFilter)) {
+                logWarning(() => `Ignoring given minification filter for ${kind} texture "${name}" because it has only one level.`);
+                if ([TextureFilter.NEAREST_MIPMAP_NEAREST, TextureFilter.NEAREST_MIPMAP_LINEAR].includes(minFilter)) {
+                    minFilter = TextureFilter.NEAREST;
+                }
+                else {
+                    minFilter = TextureFilter.LINEAR;
+                }
+            }
+        }
+        if (![TextureFilter.NEAREST, TextureFilter.LINEAR].includes(magFilter)) {
+            logWarning(() => `Ignoring given magnification filter for ${kind} texture "${name}".`);
+            if ([TextureFilter.NEAREST_MIPMAP_NEAREST, TextureFilter.NEAREST_MIPMAP_LINEAR].includes(magFilter)) {
+                magFilter = TextureFilter.NEAREST;
+            }
+            else {
+                magFilter = TextureFilter.LINEAR;
+            }
+        }
+        if (isFloatFormat(options.internalFormat)) {
+            if (![TextureFilter.NEAREST, TextureFilter.NEAREST_MIPMAP_NEAREST].includes(minFilter)
+                || magFilter !== TextureFilter.NEAREST) {
+                const extension = gl.getExtension("OES_texture_float_linear");
+                if (extension === null) {
+                    logWarning(() => `Linear filtering for floating point textures is not supported on this system.`);
+                    minFilter = TextureFilter.NEAREST;
+                    magFilter = TextureFilter.NEAREST;
+                }
+            }
+        }
+        gl.texParameteri(target, gl.TEXTURE_MIN_FILTER, minFilter);
+        gl.texParameteri(target, gl.TEXTURE_MAG_FILTER, magFilter);
+        // Define wrapping behavior.
+        let wrapS;
+        let wrapT;
+        let wrapR;
+        if (options.wrap === undefined) {
+            wrapS = TextureWrap.CLAMP_TO_EDGE;
+            wrapT = TextureWrap.CLAMP_TO_EDGE;
+            wrapR = TextureWrap.CLAMP_TO_EDGE;
+        }
+        else if (Array.isArray(options.wrap)) {
+            wrapS = options.wrap[0];
+            wrapT = options.wrap[1];
+            wrapR = options.wrap[2] ?? TextureWrap.CLAMP_TO_EDGE;
+            if (target === TextureTarget.TEXTURE_2D && options.wrap.length > 2) {
+                logWarning(() => `Ignoring given wrap R mode for ${kind} texture "${name}" because it has only two dimensions.`);
             }
         }
         else {
-            defineTextureImpl(gl, glTexture, target, source, options);
+            wrapS = options.wrap;
+            wrapT = options.wrap;
+            wrapR = options.wrap;
         }
-        if (source === null) {
-            logInfo(() => `Created empty ${isCubemap ? 'cubemap' : 'texture'} "${name}".`);
+        gl.texParameteri(target, gl.TEXTURE_WRAP_S, wrapS);
+        gl.texParameteri(target, gl.TEXTURE_WRAP_T, wrapT);
+        if (target !== TextureTarget.TEXTURE_2D) { // TODO: can I set the wrap mode for 2D Array Textures?
+            gl.texParameteri(target, gl.TEXTURE_WRAP_R, wrapR);
         }
-        else if (ArrayBuffer.isView(source)) {
-            logInfo(() => `Created texture "${name}" from a data view.`);
-        }
-        else {
-            logInfo(() => `Created texture "${name}" with image data.`);
+        // Enable anisotropic filtering if supported and requested.
+        if (anisotropyExtension) {
+            if (target === TextureTarget.TEXTURE_CUBE_MAP) {
+                logWarning(() => 'Anisotropic filtering is not supported for cubemap textures.');
+            }
+            else {
+                gl.texParameterf(gl.TEXTURE_2D, anisotropyExtension.TEXTURE_MAX_ANISOTROPY_EXT, gl.getParameter(anisotropyExtension.MAX_TEXTURE_MAX_ANISOTROPY_EXT));
+            }
         }
     }
     catch (error) {
@@ -428,12 +754,395 @@ function createTexture(gl, name, target = TextureTarget.TEXTURE_2D, source = nul
         error.message = `Failed to create texture "${name}": ${error.message}`;
         throw error;
     }
+    finally {
+        gl.bindTexture(target, null);
+    }
     // Return the texture.
     return {
         name,
-        glTexture,
-        target: target,
+        glObject: glTexture,
+        target,
+        width,
+        height,
+        depth: depth ?? 1,
+        levels: options.levels,
+        internalFormat: options.internalFormat,
+        compareFunc: options.compareFunc ?? TextureCompareFunc.NONE,
+        attachmentType: AttachmentType.TEXTURE,
     };
+}
+/**
+ * Updates the contents of an existing Texture object.
+ * Since textures in glance are immutable, this cannot redefine the size or format of the texture.
+ * @param gl The WebGL context.
+ * @param texture The texture object to update.
+ * @param source The pixel or image data.
+ * @param options Additional options for the texture:
+ * - `target`: The texture target, defaults to the texture's target.
+ * - `level`: The mipmap level to update, defaults to 0.
+ * - `createMipMaps`: Whether to generate mipmaps for the texture, defaults to `true`.
+ * - `wipTextureUnit`: The texture unit to use for the WIP texture. Defaults to the highest texture unit available.
+ * - `srcDataType`: The data type of the source data. Defaults to the data type of the given data.
+ * - `flipY`: Whether to flip the image vertically, defaults to `false`.
+ */
+function updateTexture(gl, texture, data, options = {}) {
+    // When updating cubemap faces, we must know which one.
+    if (options.target === undefined) {
+        if (texture.target === TextureTarget.TEXTURE_CUBE_MAP) {
+            throwError(() => `You need to specify an explicit target for cube map textures.`);
+        }
+        options.target = texture.target;
+    }
+    else if (texture.target === TextureTarget.TEXTURE_CUBE_MAP) {
+        if (!(options.target >= TextureDataTarget.TEXTURE_CUBE_MAP_POSITIVE_X
+            && options.target <= TextureDataTarget.TEXTURE_CUBE_MAP_NEGATIVE_Z)) {
+            throwError(() => `Invalid data target for cube map texture: ${options.target}.`);
+        }
+    }
+    // The Mipmap level defaults to zero.
+    if (options.level === undefined) {
+        options.level = 0;
+    }
+    else if (options.level < 0 || !Number.isSafeInteger(options.level)) {
+        throwError(() => `Invalid mipmap level: ${options.level}.`);
+    }
+    // Use the highest texture unit as the WIP unit by default.
+    options.wipTextureUnit = getWIPTextureUnit(gl, options.wipTextureUnit);
+    // Determine the source data type.
+    if (options.srcDataType === undefined) {
+        if (ArrayBuffer.isView(data)) {
+            options.srcDataType = getDefaultSrcDataType(data);
+        }
+        else {
+            options.srcDataType = TextureSrcDataType.UNSIGNED_BYTE;
+        }
+    }
+    else {
+        if (ArrayBuffer.isView(data)) {
+            validateSrcDataType(data, options.srcDataType);
+        }
+        else {
+            if (options.srcDataType !== TextureSrcDataType.UNSIGNED_BYTE) {
+                throwError(() => `When defining a texture with a 'TexImageSource', the source data type must be 'UNSIGNED_BYTE'`);
+            }
+        }
+    }
+    if (!matchInternalFormatAndDataType(texture.internalFormat, options.srcDataType)) {
+        throwError(() => `Invalid combination of internal format ${texture.internalFormat} and source data type ${options.srcDataType}. See https://registry.khronos.org/webgl/specs/latest/2.0/#TEXTURE_TYPES_FORMATS_FROM_DOM_ELEMENTS_TABLE`);
+    }
+    // Determine the `format` argument for `texImage2D` based on the given internal format.
+    const format = getTextureFormat(gl, texture.internalFormat);
+    // Define the texture
+    try {
+        gl.activeTexture(gl.TEXTURE0 + options.wipTextureUnit);
+        gl.bindTexture(texture.target, texture.glObject);
+        if (options.flipY ?? false) {
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+        }
+        // 3D and 2D Array textures
+        if (texture.depth > 1) {
+            gl.texSubImage3D(texture.target, options.level, 0, 0, 0, texture.width, texture.height, texture.depth, format, options.srcDataType, data);
+        }
+        // 2D and Cube Map textures
+        else {
+            gl.texSubImage2D(options.target, options.level, 0, // TODO: support partial texture updates
+            0, texture.width, texture.height, format, options.srcDataType, data);
+        }
+        // Update the mipmaps if requested and possible.
+        if (options.createMipMaps) {
+            if (!isPowerOf2(texture.width) || !isPowerOf2(texture.height) || !isPowerOf2(texture.depth)) {
+                logWarning(() => 'Mipmaps are only supported for textures with power-of-two dimensions.');
+            }
+            else {
+                gl.generateMipmap(texture.target);
+                gl.texParameteri(texture.target, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+                console.log(`Generated Mipmaps for texture "${texture.name}".`);
+            }
+        }
+    }
+    catch (error) {
+        error.message = `Failed to define texture "${texture.name}": ${error.message}`;
+        throw error;
+    }
+    finally {
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.bindTexture(texture.target, null);
+    }
+}
+// Renderbuffer ============================================================= //
+/**
+ * Creates a new Renderbuffer object.
+ * @param gl The WebGL context.
+ * @param name The name of the Renderbuffer.
+ * @param width The width of the Renderbuffer, must be larger than zero.
+ * @param height The height of the Renderbuffer, must be larger than zero.
+ * @param internalFormat The internal format of the Renderbuffer.
+ * @returns The Renderbuffer object.
+ */
+function createRenderbuffer(gl, name, width, height, internalFormat) {
+    // Validate the parameters.
+    if (width < 1 || height < 1 || !Number.isSafeInteger(width) || !Number.isSafeInteger(height)) {
+        throwError(() => `Invalid renderbuffer dimensions: ${width}x${height} of renderbuffer "${name}".`);
+    }
+    // TODO: check that the dimensions are less than or equal to the value of GL_MAX_RENDERBUFFER_SIZE
+    // See https://registry.khronos.org/OpenGL-Refpages/es3.0/html/glRenderbufferStorageMultisample.xhtml
+    // Create the Renderbuffer.
+    const glRenderbuffer = gl.createRenderbuffer();
+    if (glRenderbuffer === null) {
+        throwError(() => `Failed to create a new WebGL renderbuffer object for "${name}".`);
+    }
+    // Define the Renderbuffer.
+    try {
+        gl.bindRenderbuffer(gl.RENDERBUFFER, glRenderbuffer);
+        // TODO: Multisampled Renderbuffers
+        gl.renderbufferStorage(gl.RENDERBUFFER, internalFormat, width, height);
+    }
+    // Delete the Renderbuffer again if anything goes wrong.
+    catch (e) {
+        gl.deleteRenderbuffer(glRenderbuffer);
+        throw e;
+    }
+    // Always restore the WebGL state.
+    finally {
+        gl.bindRenderbuffer(gl.RENDERBUFFER, null);
+    }
+    // Return the finished Renderbuffer object.
+    return {
+        name,
+        glObject: glRenderbuffer,
+        width,
+        height,
+        internalFormat,
+        attachmentType: AttachmentType.RENDERBUFFER,
+    };
+}
+// Framebuffer ============================================================== //
+/** Tests if a given object is a Framebuffer attachment (Texture or Renderbuffer). */
+function isFramebufferAttachment(obj) {
+    return Object.hasOwn(obj, "attachmentType");
+}
+/**
+ * Create and define a new Framebuffer object.
+ * @param gl The WebGL context.
+ * @param name The name of the Framebuffer.
+ * @param color All color attachments.
+ * @param depth The depth attachment.
+ * @param stencil The stencil attachment.
+ * @returns The Framebuffer object.
+ */
+function createFramebuffer(gl, name, color = null, depth = null, stencil = null) {
+    // Ensure that the color attachments are valid.
+    const colorAttachments = (Array.isArray(color) ? color : color === null ? [] : [color]).map((obj) => (isFramebufferAttachment(obj) ? { attachment: obj } : obj));
+    const depthAttachment = depth === null ? null : isFramebufferAttachment(depth) ? { attachment: depth } : depth;
+    const stencilAttachment = stencil === null ? null : isFramebufferAttachment(stencil) ? { attachment: stencil } : stencil;
+    const maxColorAttachmentCount = gl.getParameter(gl.MAX_COLOR_ATTACHMENTS);
+    if (colorAttachments.length > maxColorAttachmentCount) {
+        throwError(() => `Framebuffer "${name}" has ${colorAttachments.length} color attachments, but the maximum is ${maxColorAttachmentCount}.`);
+    }
+    let framebufferSize = null; // [height, width]
+    for (let i = 0; i < colorAttachments.length; ++i) {
+        const attachment = colorAttachments[i].attachment;
+        // Check that texture attachments are valid.
+        if (attachment.attachmentType == AttachmentType.TEXTURE) {
+            const texture = attachment;
+            if (framebufferSize === null) {
+                framebufferSize = [texture.width, texture.height];
+            }
+            else if (texture.width !== framebufferSize[0] || texture.height !== framebufferSize[1]) {
+                throwError(() => `Framebuffer "${name}" has color attachments with different dimensions.`);
+            }
+        }
+        // Check that renderbuffer attachments are valid.
+        else {
+            const renderbuffer = attachment;
+            if (framebufferSize === null) {
+                framebufferSize = [renderbuffer.width, renderbuffer.height];
+            }
+            else if (renderbuffer.width !== framebufferSize[0] || renderbuffer.height !== framebufferSize[1]) {
+                throwError(() => `Framebuffer "${name}" has color attachments with different dimensions.`);
+            }
+        }
+    }
+    if (depthAttachment !== null) {
+        const attachment = depthAttachment.attachment;
+        if (framebufferSize === null) {
+            framebufferSize = [attachment.width, attachment.height];
+        }
+        else if (attachment.width !== framebufferSize[0] || attachment.height !== framebufferSize[1]) {
+            throwError(() => `Framebuffer "${name}" has color/depth attachments with different dimensions.`);
+        }
+    }
+    // Create the Framebuffer.
+    const glFramebuffer = gl.createFramebuffer();
+    if (glFramebuffer === null) {
+        throwError(() => `Failed to create a new WebGL framebuffer object for "${name}".`);
+    }
+    // Helper functions for creating attachments.
+    function attach(attachment, location) {
+        const kind = location === gl.DEPTH_ATTACHMENT ? "depth" : `color[${location - gl.COLOR_ATTACHMENT0}]`;
+        // Attachment is a Texture.
+        if (attachment.attachment.attachmentType === AttachmentType.TEXTURE) {
+            const texture = attachment.attachment;
+            // Attachment is a 2D Texture.
+            if (texture.target === TextureTarget.TEXTURE_2D) {
+                if ((attachment.target ?? TextureDataTarget.TEXTURE_2D) !== TextureDataTarget.TEXTURE_2D) {
+                    logWarning(() => `Ignoring the target "${attachment.target}" for ${kind} attachment of framebuffer "${name}", using 'gl.TEXTURE_2D' instead.`);
+                }
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, location, gl.TEXTURE_2D, texture.glObject, attachment.level ?? 0);
+            }
+            // Attachment is a Cube Map Texture.
+            else if (texture.target === TextureTarget.TEXTURE_CUBE_MAP) {
+                if (attachment.target === undefined) {
+                    throwError(() => `Missing target for cubemap ${kind} attachment of framebuffer "${name}".`);
+                }
+                if (!(attachment.target >= TextureDataTarget.TEXTURE_CUBE_MAP_POSITIVE_X
+                    && attachment.target <= TextureDataTarget.TEXTURE_CUBE_MAP_NEGATIVE_Z)) {
+                    throwError(() => `Invalid data target for cube map texture: ${attachment.target}.`);
+                }
+                gl.framebufferTexture2D(gl.FRAMEBUFFER, location, attachment.target, texture.glObject, attachment.level ?? 0);
+            }
+            // Attachment is a 3D or 2D Array Texture.
+            else {
+                if (attachment.target ?? texture.target !== texture.target) {
+                    const textureTarget = texture.target === TextureTarget.TEXTURE_2D_ARRAY ? 'gl.TEXTURE_2D_ARRAY' : 'gl.TEXTURE_3D';
+                    logWarning(() => `Ignoring the target "${attachment.target}" for ${kind} attachment of framebuffer "${name}", using ${textureTarget} instead.`);
+                }
+                if (attachment.layer === undefined) {
+                    const textureKind = texture.target === TextureTarget.TEXTURE_2D_ARRAY ? "2D array" : "3D";
+                    logWarning(() => `Missing layer for ${kind} attachment (which is a ${textureKind} texture) of framebuffer "${name}", using layer 0 by default.`);
+                }
+                gl.framebufferTextureLayer(gl.FRAMEBUFFER, location, texture.glObject, attachment.level ?? 0, attachment.layer ?? 0);
+            }
+        }
+        // Attachment is a Renderbuffer.
+        else {
+            const renderbuffer = attachment.attachment;
+            if (attachment.level !== undefined) {
+                logWarning(() => `Ignoring given level ${attachment.level} for renderbuffer ${kind} attachment of framebuffer "${name}".`);
+            }
+            if (attachment.target !== undefined) {
+                logWarning(() => `Ignoring given target ${attachment.target} for renderbuffer ${kind} attachment of framebuffer "${name}".`);
+            }
+            gl.framebufferRenderbuffer(gl.FRAMEBUFFER, location, gl.RENDERBUFFER, renderbuffer.glObject);
+        }
+    }
+    // Define the Framebuffer.
+    try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, glFramebuffer);
+        // Attach the color attachments.
+        if (colorAttachments.length === 0) {
+            gl.drawBuffers([gl.NONE]);
+            gl.readBuffer(gl.NONE);
+        }
+        else {
+            const drawBuffers = [];
+            for (let i = 0; i < colorAttachments.length; ++i) {
+                const location = gl.COLOR_ATTACHMENT0 + i;
+                attach(colorAttachments[i], location);
+                drawBuffers.push(location);
+            }
+            gl.drawBuffers(drawBuffers);
+        }
+        // Attach the depth attachment.
+        if (depthAttachment !== null) {
+            attach(depthAttachment, gl.DEPTH_ATTACHMENT);
+        }
+        // TODO: support stencil (and depth/stencil combination) attachments
+        if (stencilAttachment !== null) {
+            throwError(() => `Stencil attachments are not supported yet.`);
+        }
+        // Check that the framebuffer is complete.
+        const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+            throwError(() => {
+                switch (status) {
+                    case gl.FRAMEBUFFER_INCOMPLETE_ATTACHMENT:
+                        return `Incomplete framebuffer '${name}'! One or more framebuffer attachment points are incomplete.`;
+                    case gl.FRAMEBUFFER_INCOMPLETE_DIMENSIONS:
+                        return `Incomplete framebuffer '${name}'! One or more of the framebuffer attachment's dimensions are not the same.`;
+                    case gl.FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT:
+                        return `Incomplete framebuffer '${name}'! No images are attached to the framebuffer.`;
+                    case gl.FRAMEBUFFER_UNSUPPORTED:
+                        return `Incomplete framebuffer '${name}'! The combination of internal formats of the attached images violates an implementation-dependent set of restrictions.`;
+                    case gl.FRAMEBUFFER_INCOMPLETE_MULTISAMPLE:
+                        return `Incomplete framebuffer '${name}'! The value of GL_FRAMEBUFFER_ATTACHMENT_TEXTURE_SAMPLES is not the same for all attached textures.`;
+                    default:
+                        return `Incomplete framebuffer '${name}'! Unknown error code ${status}.`;
+                }
+            });
+        }
+    }
+    // Delete the Framebuffer on error.
+    catch (e) {
+        gl.deleteFramebuffer(glFramebuffer);
+        throw e;
+    }
+    // Always restore the WebGL state.
+    finally {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+    // Return the Framebuffer object
+    return {
+        name,
+        glObject: glFramebuffer,
+        color: colorAttachments,
+        depth: depthAttachment,
+        stencil: stencilAttachment,
+    };
+}
+/**
+ * Updates the layer of a 3D or 2D Array Texture attachment of a Framebuffer.
+ * Use this to render slices into a volumetric texture.
+ * @param gl The WebGL context.
+ * @param framebuffer The Framebuffer to update.
+ * @param location WebGL location constant of the attachment to update.
+ * @param layer New layer to render into.
+ * @param level (optional) Mipmap level to update, defaults to 0.
+ */
+function updateFramebufferLayer(gl, framebuffer, location, layer, level = 0) {
+    // Find the attachment at the given location.
+    let locationName;
+    let attachment;
+    switch (location) {
+        case gl.DEPTH_ATTACHMENT:
+            attachment = framebuffer.depth ?? throwError(() => `Framebuffer "${framebuffer.name}" has no depth attachment.`);
+            locationName = "depth";
+            break;
+        case gl.STENCIL_ATTACHMENT:
+            attachment = framebuffer.stencil ?? throwError(() => `Framebuffer "${framebuffer.name}" has no stencil attachment.`);
+            locationName = "stencil";
+            break;
+        default:
+            attachment = framebuffer.color[location - gl.COLOR_ATTACHMENT0] ?? throwError(() => `Framebuffer "${framebuffer.name}" has no color attachment at location ${location}.`);
+            locationName = `color[${location - gl.COLOR_ATTACHMENT0}]`;
+    }
+    // Maybe the attachment is already correct.
+    if (attachment.layer === layer && attachment.level === (level ?? attachment.level)) {
+        return;
+    }
+    // Check that the attachment is a 3D or 2D Array Texture with the correct depth.
+    if (attachment.attachment.attachmentType !== AttachmentType.TEXTURE) {
+        throwError(() => `Framebuffer "${framebuffer.name}" has no texture as its ${locationName} attachment, but a renderbuffer.`);
+    }
+    const texture = attachment.attachment;
+    if (texture.target !== TextureTarget.TEXTURE_2D_ARRAY && texture.target !== TextureTarget.TEXTURE_3D) {
+        const textureKind = texture.target === TextureTarget.TEXTURE_2D ? "2D" : "cubemap";
+        throwError(() => `Framebuffer "${framebuffer.name}" has no 3D or 2D array texture as its ${locationName} attachment, but a ${textureKind} texture.`);
+    }
+    if (layer < 0 || layer >= texture.depth) {
+        throwError(() => `Invalid layer ${layer} for ${locationName} attachment of framebuffer "${framebuffer.name}", which has a depth of ${texture.depth}.`);
+    }
+    // Keep track of the current WebGL state.
+    const currentFramebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    // Update the framebuffer.
+    try {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer.glObject);
+        gl.framebufferTextureLayer(gl.FRAMEBUFFER, location, texture.glObject, level ?? attachment.level ?? 0, layer);
+    }
+    // Always restore the WebGL state.
+    finally {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, currentFramebuffer);
+    }
 }
 // Shader =================================================================== //
 function compileWebGLShader(gl, source, stage) {
@@ -456,7 +1165,7 @@ function compileWebGLShader(gl, source, stage) {
  */
 function createVertexShader(gl, source) {
     return {
-        glShader: compileWebGLShader(gl, source, gl.VERTEX_SHADER),
+        glObject: compileWebGLShader(gl, source, gl.VERTEX_SHADER),
         stage: ShaderStage.VERTEX,
         source,
     };
@@ -469,7 +1178,7 @@ function createVertexShader(gl, source) {
  */
 function createFragmentShader(gl, source) {
     return {
-        glShader: compileWebGLShader(gl, source, gl.FRAGMENT_SHADER),
+        glObject: compileWebGLShader(gl, source, gl.FRAGMENT_SHADER),
         stage: ShaderStage.FRAGMENT,
         source,
     };
@@ -481,11 +1190,11 @@ function createFragmentShader(gl, source) {
  * @param shader The shader to delete.
  */
 function deleteShader(gl, shader) {
-    if (shader.glShader === null) {
+    if (shader.glObject === null) {
         return;
     }
-    gl.deleteShader(shader.glShader);
-    shader.glShader = null;
+    gl.deleteShader(shader.glObject);
+    shader.glObject = null;
 }
 function findAttributes(source) {
     const regex = /(?:layout\s*\(location\s*=\s*(?<loc>\d+)\)\s*)?in\s+(?:(?<prec>lowp|mediump|highp)\s+)?(?<type>\w+)\s+(?<name>\w+)\s*;/g;
@@ -537,10 +1246,11 @@ function setUniform(gl, uniform) {
     const isInt = (val) => Number.isSafeInteger(val);
     const isUint = (val) => isInt(val) && val >= 0;
     const isBool = (val) => typeof val === 'boolean' || (isInt(val) && (val === 0 || val === 1));
-    const isArrayOfNumbers = (size) => Array.isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isNumber(val));
-    const isArrayOfBools = (size) => Array.isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isBool(val));
-    const isArrayOfInts = (size) => Array.isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isInt(val));
-    const isArrayOfUints = (size) => Array.isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isUint(val));
+    const isArray = (val) => Array.isArray(val) || ArrayBuffer.isView(val);
+    const isArrayOfNumbers = (size) => isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isNumber(val));
+    const isArrayOfBools = (size) => isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isBool(val));
+    const isArrayOfInts = (size) => isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isInt(val));
+    const isArrayOfUints = (size) => isArray(uniform.value) && uniform.value.length == size * uniform.size && uniform.value.every(val => isUint(val));
     const errorMessage = (size, type) => `Value of uniform must be an array of ${size * uniform.size} ${type}s!`;
     // Assign non-sampler uniforms.
     switch (uniform.type) {
@@ -783,12 +1493,25 @@ function uniformHasNonZeroDefault(type) {
             return true;
     }
 }
+/**
+ * Create a new Shader Program from the given Vertex and Fragment Shaders.
+ * @param gl The WebGL context.
+ * @param name The name of the shader program.
+ * @param vertexShader The vertex shader.
+ * @param fragmentShader The fragment shader.
+ * @param uniforms The initial values of the uniforms.
+ * Unspecified non-sampler uniforms are initialized to a default value based on its type (zero or identity matrix).
+ * Unspecified sampler uniforms will cause an error.
+ * @param attributes Manual locations for the attributes.
+ * If an attribute is not specified, the location is determined automatically.
+ * @returns The Shader Program object.
+ */
 function createShaderProgram(gl, name, vertexShader, fragmentShader, uniforms = {}, attributes = {}) {
     // Check that the shaders are valid.
-    if (vertexShader.glShader === null) {
+    if (vertexShader.glObject === null) {
         throwError(() => `Cannot create shader program "${name}" because the vertex shader has been deleted.`);
     }
-    if (fragmentShader.glShader === null) {
+    if (fragmentShader.glObject === null) {
         throwError(() => `Cannot create shader program "${name}" because the fragment shader has been deleted.`);
     }
     // Create the shader program.
@@ -796,8 +1519,8 @@ function createShaderProgram(gl, name, vertexShader, fragmentShader, uniforms = 
     if (glProgram === null) {
         throwError(() => `Failed to create a new WebGL shader program for "${name}".`);
     }
-    gl.attachShader(glProgram, vertexShader.glShader);
-    gl.attachShader(glProgram, fragmentShader.glShader);
+    gl.attachShader(glProgram, vertexShader.glObject);
+    gl.attachShader(glProgram, fragmentShader.glObject);
     // Find all attributes in the vertex shader.
     // If the user specified locations for the attributes, bind them now.
     const foundAttributes = findAttributes(vertexShader.source);
@@ -821,8 +1544,8 @@ function createShaderProgram(gl, name, vertexShader, fragmentShader, uniforms = 
     gl.linkProgram(glProgram);
     if (!gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
         throwError(() => `Failed to link shader program "${name}": ${gl.getProgramInfoLog(glProgram)}`
-            + `\nVertex Shader log: ${gl.getShaderInfoLog(vertexShader)}`
-            + `\nFragent Shader log: ${gl.getShaderInfoLog(fragmentShader)}`);
+            + `\nVertex Shader log: ${gl.getShaderInfoLog(vertexShader.glObject)}`
+            + `\nFragent Shader log: ${gl.getShaderInfoLog(fragmentShader.glObject)}`);
     }
     // Store the actual location of all attributes.
     const shaderAttributes = new Map();
@@ -899,14 +1622,13 @@ function createShaderProgram(gl, name, vertexShader, fragmentShader, uniforms = 
     // Return the shader program.
     return {
         name,
-        glProgram,
+        glObject: glProgram,
         vertexShader,
         fragmentShader,
         attributes: shaderAttributes,
         uniforms: shaderUniforms,
     };
 }
-// TODO: Framebuffers (see glance-v1)
 // Draw Call ================================================================ //
 function createTextureUnit(texture) {
     switch (texture.target) {
@@ -922,29 +1644,29 @@ function createTextureUnit(texture) {
             throwError(() => `Unsupported texture target: ${texture.target}`);
     }
 }
-function insertIntoTextureUnit(textureUnit, texture) {
+function insertIntoTextureUnit(textureUnit, texture, unitId) {
     switch (texture.target) {
         case TextureTarget.TEXTURE_2D:
             if (textureUnit.texture_2d !== undefined) {
-                throwError(() => `Texture unit already contains a 2D texture!`);
+                throwError(() => `Texture unit ${unitId} already contains a 2D texture!`);
             }
             textureUnit.texture_2d = texture;
             break;
         case TextureTarget.TEXTURE_3D:
             if (textureUnit.texture_3d !== undefined) {
-                throwError(() => `Texture unit already contains a 3D texture!`);
+                throwError(() => `Texture unit ${unitId} already contains a 3D texture!`);
             }
             textureUnit.texture_3d = texture;
             break;
         case TextureTarget.TEXTURE_CUBE_MAP:
             if (textureUnit.texture_cube !== undefined) {
-                throwError(() => `Texture unit already contains a cube map!`);
+                throwError(() => `Texture unit ${unitId} already contains a cube map!`);
             }
             textureUnit.texture_cube = texture;
             break;
         case TextureTarget.TEXTURE_2D_ARRAY:
             if (textureUnit.texture_2d_array !== undefined) {
-                throwError(() => `Texture unit already contains a 2D array texture!`);
+                throwError(() => `Texture unit ${unitId} already contains a 2D array texture!`);
             }
             textureUnit.texture_2d_array = texture;
             break;
@@ -952,7 +1674,16 @@ function insertIntoTextureUnit(textureUnit, texture) {
             throwError(() => `Unsupported texture target: ${texture.target}`);
     }
 }
+/**
+ * Checks if the given attribute type matches the given GLSL type.
+ * With matnxm types, the n signifies the number of columns and the m the number
+ * of rows. See https://www.khronos.org/opengl/wiki/Data_Type_(GLSL)#Matrices
+ * @param attr Attribute description.
+ * @param glslType GLSL type name.
+ * @returns True if the attribute type matches the GLSL type.
+ */
 function matchAttributeType(attr, glslType) {
+    const attributeWidth = attr.width ?? 1;
     switch (attr.type) {
         case AttributeDataType.BYTE:
         case AttributeDataType.UNSIGNED_BYTE:
@@ -965,16 +1696,16 @@ function matchAttributeType(attr, glslType) {
             switch (glslType) {
                 case 'int':
                 case 'uint':
-                    return attr.size === 1;
+                    return attr.size === 1 && attributeWidth === 1;
                 case 'ivec2':
                 case 'uvec2':
-                    return attr.size === 2;
+                    return attr.size === 2 && attributeWidth === 1;
                 case 'ivec3':
                 case 'uvec3':
-                    return attr.size === 3;
+                    return attr.size === 3 && attributeWidth === 1;
                 case 'ivec4':
                 case 'uvec4':
-                    return attr.size === 4;
+                    return attr.size === 4 && attributeWidth === 1;
                 default:
                     return false;
             }
@@ -982,18 +1713,110 @@ function matchAttributeType(attr, glslType) {
         case AttributeDataType.HALF_FLOAT:
             switch (glslType) {
                 case 'float':
-                    return attr.size === 1;
+                    return attr.size === 1 && attributeWidth === 1;
                 case 'vec2':
-                    return attr.size === 2;
+                    return attr.size === 2 && attributeWidth === 1;
                 case 'vec3':
-                    return attr.size === 3;
+                    return attr.size === 3 && attributeWidth === 1;
                 case 'vec4':
-                    return attr.size === 4;
-                // TODO: handle cases where the GLSL type is a matrix
+                    return attr.size === 4 && attributeWidth === 1;
+                case 'mat2':
+                case 'mat2x2':
+                    return attr.size === 2 && attributeWidth === 2;
+                case 'mat2x3':
+                    return attr.size === 3 && attributeWidth === 2;
+                case 'mat2x4':
+                    return attr.size === 4 && attributeWidth === 2;
+                case 'mat3x2':
+                    return attr.size === 2 && attributeWidth === 3;
+                case 'mat3':
+                case 'mat3x3':
+                    return attr.size === 3 && attributeWidth === 3;
+                case 'mat3x4':
+                    return attr.size === 4 && attributeWidth === 3;
+                case 'mat4x2':
+                    return attr.size === 2 && attributeWidth === 4;
+                case 'mat4x3':
+                    return attr.size === 3 && attributeWidth === 4;
+                case 'mat4':
+                case 'mat4x4':
+                    return attr.size === 4 && attributeWidth === 4;
                 default:
                     return false;
             }
     }
+}
+/**
+ * Produces the appropriate GLSL type for the given attribute.
+ * @param attr Attribute description.
+ * @returns The GLSL type name.
+ * @throws If the attribute type is invalid.
+ */
+function attributeToGLSLType(attr) {
+    switch (attr.type) {
+        case AttributeDataType.BYTE:
+        case AttributeDataType.SHORT:
+        case AttributeDataType.INT:
+        case AttributeDataType.INT_2_10_10_10_REV:
+            switch (attr.width ?? 1) {
+                case 1:
+                    switch (attr.size) {
+                        case 1: return 'int';
+                        case 2: return 'ivec2';
+                        case 3: return 'ivec3';
+                        case 4: return 'ivec4';
+                    }
+            }
+            break;
+        case AttributeDataType.UNSIGNED_BYTE:
+        case AttributeDataType.UNSIGNED_SHORT:
+        case AttributeDataType.UNSIGNED_INT:
+        case AttributeDataType.UNSIGNED_INT_2_10_10_10_REV:
+            switch (attr.width ?? 1) {
+                case 1:
+                    switch (attr.size) {
+                        case 1: return 'uint';
+                        case 2: return 'uvec2';
+                        case 3: return 'uvec3';
+                        case 4: return 'uvec4';
+                    }
+            }
+            break;
+        case AttributeDataType.FLOAT:
+        case AttributeDataType.HALF_FLOAT:
+            switch (attr.width ?? 1) {
+                case 1:
+                    switch (attr.size) {
+                        case 1: return 'float';
+                        case 2: return 'vec2';
+                        case 3: return 'vec3';
+                        case 4: return 'vec4';
+                    }
+                    break;
+                case 2:
+                    switch (attr.size) {
+                        case 2: return 'mat2';
+                        case 3: return 'mat2x3';
+                        case 4: return 'mat2x4';
+                    }
+                    break;
+                case 3:
+                    switch (attr.size) {
+                        case 2: return 'mat3x2';
+                        case 3: return 'mat3';
+                        case 4: return 'mat3x4';
+                    }
+                    break;
+                case 4:
+                    switch (attr.size) {
+                        case 2: return 'mat4x2';
+                        case 3: return 'mat4x3';
+                        case 4: return 'mat4';
+                    }
+                    break;
+            }
+    }
+    throwError(() => `Invalid attribute type: ${attr.type} with a size of ${attr.size} and a width of ${attr.width}.`);
 }
 /**
  * Creates a new Draw Call.
@@ -1001,41 +1824,53 @@ function matchAttributeType(attr, glslType) {
  * @param vao
  * @param uniforms Uniform update callbacks to update uniforms before drawing.
  */
-function createDrawCall(gl, program, vao, uniforms, textures, enabled, indexCount, indexOffset) {
+function createDrawCall(// TODO: add support for blending (see lecture on deferred rendering)
+gl, program, vao, options = {}) {
     // Validate the arguments.
-    uniforms = uniforms ?? {};
-    textures = textures ?? [];
-    indexCount = indexCount ?? vao.ibo.size;
-    indexOffset = indexOffset ?? 0;
+    const uniforms = options.uniforms ?? {};
+    const textures = options.textures ?? [];
+    const cullFace = options.cullFace ?? CullFace.NONE;
+    const depthTest = options.depthTest ?? DepthTest.NONE;
+    const indexCount = options.indexCount === undefined ? vao.ibo.size : Math.ceil(options.indexCount);
+    const indexOffset = options.indexOffset === undefined ? 0 : Math.ceil(options.indexOffset);
+    const instanceCount = options.instanceCount === undefined ? 1 : Math.ceil(options.instanceCount);
+    const renderDepth = options.renderDepth ?? true;
     if (indexCount <= 0) {
         throwError(() => `Invalid index count: ${indexCount}.`);
     }
     if (indexOffset < 0) {
         throwError(() => `Invalid index offset: ${indexOffset}.`);
     }
-    indexCount = Math.ceil(indexCount);
-    indexOffset = Math.ceil(indexOffset);
     if (indexOffset + indexCount > vao.ibo.size) {
         throwError(() => `Index offset ${indexOffset} and count ${indexCount} exceed the size of the index buffer (${vao.ibo.size}).`);
     }
+    if (instanceCount <= 0) {
+        throwError(() => `Instance count cannot be <= 0, is: ${instanceCount}.`);
+    }
     // Ensure that the attribute locations of the VAO match the shader program.
-    for (const shaderAttribute of program.attributes.values()) {
+    for (const [attributeName, shaderAttribute] of program.attributes.entries()) {
         const vaoAttributeRef = vao.attributes.get(shaderAttribute.location);
         if (vaoAttributeRef === undefined) {
-            throwError(() => `VAO "${vao.name}" does not provide an attribute at location ${shaderAttribute.location} as expected for shader program "${program.name}"!`);
+            throwError(() => `VAO "${vao.name}" does not provide an attribute for "${attributeName}" (at location ${shaderAttribute.location}) of shader program "${program.name}"!`);
         }
         const vaoAttribute = vaoAttributeRef.buffer.attributes.get(vaoAttributeRef.name);
         if (vaoAttribute === undefined) {
             throwError(() => `Missing attribute "${vaoAttributeRef.name}" in VBO "${vaoAttributeRef.buffer.name}"!`);
         }
         if (!matchAttributeType(vaoAttribute, shaderAttribute.type)) {
-            throwError(() => `Attribute "${vaoAttributeRef.name}" in VBO "${vaoAttributeRef.buffer.name}" has type ${vaoAttribute.type} but shader program "${program.name}" expects type ${shaderAttribute.type}!`);
+            throwError(() => {
+                const attributeType = attributeToGLSLType(vaoAttribute);
+                return `Attribute "${vaoAttributeRef.name}" in VBO "${vaoAttributeRef.buffer.name}" has type '${attributeType}' but shader program "${program.name}" expects type '${shaderAttribute.type} at location ${shaderAttribute.location}'!`;
+            });
+        }
+        if (attributeName != vaoAttributeRef.name) {
+            logWarning(() => `Attribute "${attributeName}" of shader program "${program.name}" at location ${shaderAttribute.location} is bound to attribute "${vaoAttributeRef.name}" in VBO "${vaoAttributeRef.buffer.name}"!`);
         }
     }
     // Ensure that all uniforms actually exist in the shader program
     for (const uniformName of Object.keys(uniforms)) {
         if (!program.uniforms.has(uniformName)) {
-            throwError(() => `Uniform "${uniformName}" not found in shader program "${program.name}"!`);
+            logWarning(() => `Uniform "${uniformName}" not found in shader program "${program.name}"!`);
         }
     }
     // Create the texture unit mapping.
@@ -1050,7 +1885,7 @@ function createDrawCall(gl, program, vao, uniforms, textures, enabled, indexCoun
             textureUnits.set(unitId, createTextureUnit(texture));
         }
         else {
-            insertIntoTextureUnit(usedUnit, texture);
+            insertIntoTextureUnit(usedUnit, texture, unitId);
         }
     }
     // Create the draw call.
@@ -1061,7 +1896,11 @@ function createDrawCall(gl, program, vao, uniforms, textures, enabled, indexCoun
         offset: indexOffset,
         uniforms: new Map(Object.entries(uniforms)),
         textures: textureUnits,
-        enabled,
+        cullFace,
+        depthTest,
+        instanceCount,
+        renderDepth,
+        enabled: options.enabled,
     };
 }
 function performDrawCall(gl, drawCall, time) {
@@ -1069,20 +1908,33 @@ function performDrawCall(gl, drawCall, time) {
     if (drawCall.enabled !== undefined && !drawCall.enabled(time)) {
         return;
     }
-    gl.bindVertexArray(drawCall.vao.glVao);
-    gl.useProgram(drawCall.program.glProgram);
+    // Bind the VAO and shader program.
+    gl.bindVertexArray(drawCall.vao.glObject);
+    gl.useProgram(drawCall.program.glObject);
+    // Set up the WebGL state for the draw call.
+    if (drawCall.cullFace !== CullFace.NONE) {
+        gl.enable(gl.CULL_FACE);
+        gl.cullFace(drawCall.cullFace);
+    }
+    if (drawCall.depthTest !== DepthTest.NONE) {
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(drawCall.depthTest);
+    }
+    gl.depthMask(drawCall.renderDepth);
     try {
         // Update the uniforms.
         for (const [uniformName, updateCallback] of drawCall.uniforms) {
             const uniform = drawCall.program.uniforms.get(uniformName);
             if (uniform === undefined) {
-                throwError(() => `Uniform "${uniformName}" from update callback not found in shader program "${drawCall.program.name}"!`);
+                // logWarning(() => `Uniform "${uniformName}" from update callback not found in shader program "${drawCall.program.name}"!`);
+                // TODO: a logWarning(once) would be nice
+                continue;
             }
             const newValue = updateCallback(time);
             if (newValue === undefined) {
                 throwError(() => `Uniform update callback for "${uniformName}" returned undefined!`);
             }
-            if (newValue === uniform.value) {
+            if (newValue == uniform.value) { // TODO: this does not seem to work for comparing matrices
                 continue; // no need to update
             }
             uniform.value = newValue;
@@ -1097,22 +1949,36 @@ function performDrawCall(gl, drawCall, time) {
         for (const [id, unit] of drawCall.textures) {
             gl.activeTexture(gl.TEXTURE0 + id);
             if (unit.texture_2d !== undefined) {
-                gl.bindTexture(gl.TEXTURE_2D, unit.texture_2d.glTexture);
+                gl.bindTexture(gl.TEXTURE_2D, unit.texture_2d.glObject);
             }
             if (unit.texture_3d !== undefined) {
-                gl.bindTexture(gl.TEXTURE_3D, unit.texture_3d.glTexture);
+                gl.bindTexture(gl.TEXTURE_3D, unit.texture_3d.glObject);
             }
             if (unit.texture_cube !== undefined) {
-                gl.bindTexture(gl.TEXTURE_CUBE_MAP, unit.texture_cube.glTexture);
+                gl.bindTexture(gl.TEXTURE_CUBE_MAP, unit.texture_cube.glObject);
             }
             if (unit.texture_2d_array !== undefined) {
-                gl.bindTexture(gl.TEXTURE_2D_ARRAY, unit.texture_2d_array.glTexture);
+                gl.bindTexture(gl.TEXTURE_2D_ARRAY, unit.texture_2d_array.glObject);
             }
         }
         // Perform the draw call.
-        gl.drawElements(gl.TRIANGLES, drawCall.count, drawCall.vao.ibo.type, drawCall.offset);
+        if (drawCall.instanceCount == 1) {
+            gl.drawElements(gl.TRIANGLES, drawCall.count, drawCall.vao.ibo.type, drawCall.offset);
+        }
+        else if (drawCall.instanceCount > 1) {
+            gl.drawElementsInstanced(gl.TRIANGLES, drawCall.count, drawCall.vao.ibo.type, drawCall.offset, drawCall.instanceCount);
+        }
+        else {
+            throwError(() => `Invalid instance count: ${drawCall.instanceCount}.`);
+        }
     }
+    // Always restore the WebGL state.
     finally {
+        gl.depthMask(true);
+        gl.depthFunc(gl.ALWAYS);
+        gl.disable(gl.DEPTH_TEST);
+        gl.cullFace(gl.BACK);
+        gl.disable(gl.CULL_FACE);
         gl.useProgram(null);
         gl.bindVertexArray(null);
     }
