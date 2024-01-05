@@ -212,19 +212,95 @@ const skyFragmentShader = `#version 300 es
     }
 `;
 
+const postVertexShader = `#version 300 es
+    precision highp float;
+
+    in vec2 a_pos;
+    in vec2 a_texCoord;
+
+    out vec2 f_texCoord;
+
+    void main()
+    {
+        f_texCoord = a_texCoord;
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+`;
+
+const postFragmentShader = `#version 300 es
+    precision mediump float;
+
+    uniform sampler2D u_texture;
+    uniform float u_time;
+
+    in vec2 f_texCoord;
+
+    out vec4 FragColor;
+
+    vec3 greyscale(vec3 color)
+    {
+        return vec3(0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b);
+    }
+
+    vec3 applyKernel(sampler2D image, vec2 uv, float kernel[9], float offset)
+    {
+        const vec2 offsets[9] = vec2[](
+            vec2(-1,  1), // top-left
+            vec2( 0,  1), // top-center
+            vec2( 1,  1), // top-right
+            vec2(-1,  0), // center-left
+            vec2( 0,  0), // center-center
+            vec2( 1,  0), // center-right
+            vec2(-1, -1), // bottom-left
+            vec2( 0, -1), // bottom-center
+            vec2( 1, -1)  // bottom-right
+        );
+
+        vec3 color = vec3(0.0);
+        for(int i = 0; i < 9; i++) {
+            color += texture(image, uv + offsets[i] * offset).rgb * kernel[i];
+        }
+        return color;
+    }
+
+    const float sharpenKernel[9] = float[](
+        -1., -1., -1.,
+        -1.,  9., -1.,
+        -1., -1., -1.
+    );
+
+    const float blurKernel[9] = float[](
+        1./ 16., 2./16., 1./16.,
+        2./ 16., 4./16., 2./16.,
+        1./ 16., 2./16., 1./16.
+    );
+
+    const float grainStrength = 65.0;
+
+    void main() {
+        vec2 uv = gl_FragCoord.xy / vec2(512.0, 512.0);
+        float x = (uv.x + 4.0 ) * (uv.y + 4.0 ) * (mod(u_time, 10000.));
+        float grain = 1.0 - ((mod((mod(x, 13.0) + 1.0) * (mod(x, 123.0) + 1.0), 0.01)-0.005) * grainStrength);
+
+        vec3 color = texture(u_texture, f_texCoord).rgb;
+        vec3 blurred = applyKernel(u_texture, f_texCoord, blurKernel, 1.0 / 400.0);
+        vec3 sharpened = applyKernel(u_texture, f_texCoord, sharpenKernel, 1.0 / 400.0);
+
+        color = mix(color, sharpened, 1.0);
+        color = mix(color, blurred, .7);
+        color = greyscale(color);
+        color = color * grain;
+
+        FragColor = vec4(color, 1.0);
+    }
+`;
+
 
 // =============================================================================
 // Variables
 // =============================================================================
 
 const projectionMatrix = mat4.perspective(Math.PI / 4, 1, 0.1, 14);
-
-/*
-const rocketScale = 0.05;
-const rocketDistance = 1.5;
-const rocketSpeed = 0.0003;
-const rocketCount = 2200;
-*/
 
 const bulletScale = 0.05;
 let bulletSpeed = 0.005;
@@ -235,8 +311,7 @@ const enemyScale = 0.3;
 const enemyDistance = 5;
 const enemySpeed = 0.0002;
 
-// Player ----------------------------------------------------------------------
-const phongShaderPlayer = glance.buildShaderProgram(gl, "phong-shader", phongVertexShader, phongFragmentShader, {
+const phongShader = glance.buildShaderProgram(gl, "phong-shader", phongVertexShader, phongFragmentShader, {
     u_ambient: 0.1,
     u_specular: 0.6,
     u_shininess: 64,
@@ -248,7 +323,20 @@ const phongShaderPlayer = glance.buildShaderProgram(gl, "phong-shader", phongVer
     u_texSpecular: 2,
 });
 
-const { attributes: playerAttr, indices: playerIdx } = await glance.loadObj("./obj/suzanne.obj");
+const instancedPhongShader = glance.buildShaderProgram(gl, "enemy-shader", instancedPhongVertexShader, phongFragmentShader, {
+    u_ambient: 0.1,
+    u_specular: 0.6,
+    u_shininess: 64,
+    u_lightPos: [0, 0, 5],
+    u_lightColor: [1, 1, 1],
+    u_projectionMatrix: projectionMatrix,
+    u_texAmbient: 0,
+    u_texDiffuse: 1,
+    u_texSpecular: 2,
+});
+
+// Player ----------------------------------------------------------------------
+const { attributes: playerAttr, indices: playerIdx } = await glance.loadObj("./obj/aircraft.obj");
 
 const playerIBO = glance.createIndexBuffer(gl, playerIdx);
 
@@ -262,25 +350,13 @@ const playerVAO = glance.createVAO(
     gl,
     "player-vao",
     playerIBO,
-    glance.buildAttributeMap(phongShaderPlayer, playerABO),
+    glance.buildAttributeMap(phongShader, playerABO),
 );
 const playerTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/Metal_ambient.jpg");
 const playerTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
-const playerTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
+const playerTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/Metal_specular.png");
 
 // Enemy -----------------------------------------------------------------------
-const enemyShader = glance.buildShaderProgram(gl, "enemy-shader", instancedPhongVertexShader, phongFragmentShader, {
-    u_ambient: 0.1,
-    u_specular: 0.6,
-    u_shininess: 64,
-    u_lightPos: [0, 0, 5],
-    u_lightColor: [1, 1, 1],
-    u_projectionMatrix: projectionMatrix,
-    u_texAmbient: 0,
-    u_texDiffuse: 1,
-    u_texSpecular: 2,
-});
-
 const { attributes: enemyAttr, indices: enemyIdx } = await glance.loadObj("./obj/suzanne.obj");
 
 const enemyIBO = glance.createIndexBuffer(gl, enemyIdx);
@@ -302,8 +378,8 @@ const enemyVAO = glance.createVAO(
     "enemy-vao",
     enemyIBO,
     glance.combineAttributeMaps(
-        glance.buildAttributeMap(enemyShader, enemyABO),
-        glance.buildAttributeMap(enemyShader, enemyIABO),
+        glance.buildAttributeMap(instancedPhongShader, enemyABO),
+        glance.buildAttributeMap(instancedPhongShader, enemyIABO),
     ),
 );
 const enemyTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/Metal_ambient.jpg");
@@ -398,19 +474,6 @@ function updateBulletInstanceAttributes(index, posX, posY) {
 
 
 // Earth -----------------------------------------------------------------------
-
-const phongShader = glance.buildShaderProgram(gl, "phong-shader", phongVertexShader, phongFragmentShader, {
-    u_ambient: 0.1,
-    u_specular: 0.6,
-    u_shininess: 64,
-    u_lightPos: [0, 0, 5],
-    u_lightColor: [1, 1, 1],
-    u_projectionMatrix: projectionMatrix,
-    u_texAmbient: 0,
-    u_texDiffuse: 1,
-    u_texSpecular: 2,
-});
-
 const earthIBO = glance.createIndexBuffer(gl, glance.createSphereIndices(64, 64));
 
 const earthABO = glance.createAttributeBuffer(gl, "earth-abo", glance.createSphereAttributes(.9, 64, 64), {
@@ -429,73 +492,7 @@ const earthTextureAmbient = await glance.loadTextureNow(gl, "./img/Earth_Ambient
 const earthTextureDiffuse = await glance.loadTextureNow(gl, "./img/Earth_Diffuse.avif");
 const earthTextureSpecular = await glance.loadTextureNow(gl, "./img/Earth_Specular.avif");
 
-// Rockets ---------------------------------------------------------------------
-/*
-const rocketShader = glance.buildShaderProgram(gl, "rocket-shader", instancedPhongVertexShader, phongFragmentShader, {
-    u_ambient: 0.1,
-    u_specular: 0.6,
-    u_shininess: 64,
-    u_lightPos: [0, 0, 5],
-    u_lightColor: [1, 1, 1],
-    u_projectionMatrix: projectionMatrix,
-    u_texAmbient: 0,
-    u_texDiffuse: 1,
-    u_texSpecular: 2,
-});
 
-const { attributes: rocketAttr, indices: rocketIdx } = await glance.loadObj("./obj/sphere.obj");
-
-const rocketIBO = glance.createIndexBuffer(gl, rocketIdx);
-
-const rocketABO = glance.createAttributeBuffer(gl, "rocket-abo", rocketAttr, {
-    a_pos: { size: 3, type: gl.FLOAT },
-    a_texCoord: { size: 2, type: gl.FLOAT },
-    a_normal: { size: 3, type: gl.FLOAT },
-});
-
-const rocketInstanceAttributes = new Float32Array(rocketCount * 25); // 16 + 9
-const rocketIABO = glance.createAttributeBuffer(gl, "rocket-iabo", rocketInstanceAttributes, {
-    a_modelMatrix: { size: 4, width: 4, type: gl.FLOAT, divisor: 1 },
-    a_normalMatrix: { size: 3, width: 3, type: gl.FLOAT, divisor: 1 },
-});
-
-const rocketVAO = glance.createVAO(
-    gl,
-    "rocket-vao",
-    rocketIBO,
-    glance.combineAttributeMaps(
-        glance.buildAttributeMap(rocketShader, rocketABO),
-        glance.buildAttributeMap(rocketShader, rocketIABO),
-    ),
-);
-const rocketTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/Metal_ambient.jpg");
-const rocketTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
-const rocketTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
-
-function updateRocketInstanceAttributes(time)
-{
-    for (let i = 0; i < rocketCount; i++) {
-        const modelMatrix = mat4.multiply(
-            mat4.fromRotation(i * (Math.PI / rocketCount), [0, 1, 0]),
-            mat4.multiply(
-                mat4.multiply(
-                    mat4.fromRotation(i + rocketSpeed * time, [0, 0, -1]),
-                    mat4.fromTranslation([-rocketDistance, 0, 0]),
-                ),
-                mat4.fromScaling(rocketScale),
-            ),
-        );
-
-        const arrayOffset = i * 25;
-        rocketInstanceAttributes.set(modelMatrix, arrayOffset);
-        const normalMatrix = mat3.fromMat4(mat4.transpose(mat4.invert(modelMatrix)));
-        rocketInstanceAttributes.set(normalMatrix, arrayOffset + 16);
-    }
-    gl.bindBuffer(gl.ARRAY_BUFFER, rocketIABO.glObject);
-    gl.bufferData(gl.ARRAY_BUFFER, rocketInstanceAttributes, gl.DYNAMIC_DRAW);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
-}
-*/
 // Skybox ----------------------------------------------------------------------
 
 const skyShader = glance.buildShaderProgram(gl, "sky-shader", skyVertexShader, skyFragmentShader, {
@@ -521,6 +518,36 @@ const skyCubemap = await glance.loadCubemapNow(gl, "sky-texture", [
 ]);
 
 
+// Post ------------------------------------------------------------------------
+const postShader = glance.buildShaderProgram(gl, "post-shader", postVertexShader, postFragmentShader, {
+    u_texture: 0,
+});
+
+const postIBO = glance.createIndexBuffer(gl, glance.createQuadIndices());
+
+const postABO = glance.createAttributeBuffer(gl, "post-abo", glance.createQuadAttributes(), {
+    a_pos: { size: 2, type: gl.FLOAT },
+    a_texCoord: { size: 2, type: gl.FLOAT },
+});
+
+const postVAO = glance.createVAO(gl, "post-vao", postIBO, glance.buildAttributeMap(postShader, postABO));
+
+
+// =============================================================================
+// Framebuffer
+// =============================================================================
+
+const postColor = glance.createTexture(gl, "color-target", 512, 512, gl.TEXTURE_2D, null, {
+    useAnisotropy: false,
+    internalFormat: gl.RGBA8,
+    levels: 1,
+});
+
+const postDepth = glance.createRenderbuffer(gl, "depth-target", 512, 512, gl.DEPTH_COMPONENT16);
+
+const postFramebuffer = glance.createFramebuffer(gl, "framebuffer", postColor, postDepth);
+
+
 // =============================================================================
 // Draw Calls
 // =============================================================================
@@ -528,13 +555,10 @@ const skyCubemap = await glance.loadCubemapNow(gl, "sky-texture", [
 
 // Scene State
 let viewDist = 4.5;
-let viewPan = 0;
-let viewTilt = 0;
-let panDelta = 0;
-let tiltDelta = 0;
 let shoot = false;
 let shootDelayOver = true;
 let flyingBullets = 0;
+let postEffectOn = false;
 
 const viewRotationMatrix = new glance.Cached(
     () =>
@@ -568,15 +592,18 @@ let PlayerYDelta = 0;
 
 const playerModelMatrix = new glance.TimeSensitive(
     (time) => mat4.multiply(
-        mat4.fromScaling([.25, .25, .25]),
-        mat4.fromTranslation([PlayerX, PlayerY, 0]),
+        mat4.fromScaling([.2, .2, .2]),
+        mat4.multiply(
+            mat4.fromTranslation([PlayerX, PlayerY, 0]),
+            mat4.fromRotation(Math.PI * 1.5, [1, 0, 0]), // rotate to face forward
+        ),
     )
 );
 
 // Player ----------------------------------------------------------------------
 const playerDrawCall = glance.createDrawCall(
     gl,
-    phongShaderPlayer,
+    phongShader,
     playerVAO,
     {
         uniforms: {
@@ -598,7 +625,7 @@ const playerDrawCall = glance.createDrawCall(
 // Enemy -----------------------------------------------------------------------
 const enemyDrawCall = glance.createDrawCall(
     gl,
-    enemyShader,
+    instancedPhongShader,
     enemyVAO,
     {
         uniforms: {
@@ -683,29 +710,6 @@ const earthDrawCall = glance.createDrawCall(
     }
 );
 
-// Rockets ---------------------------------------------------------------------
-/*
-const rocketDrawCall = glance.createDrawCall(
-    gl,
-    rocketShader,
-    rocketVAO,
-    {
-        uniforms: {
-            u_viewMatrix: () => mat4.invert(viewMatrix.get()),
-            u_viewPos: () => vec3.transformMat4(vec3.zero(), viewMatrix.get()),
-        },
-        textures: [
-            [0, rocketTextureAmbient],
-            [1, rocketTextureDiffuse],
-            [2, rocketTextureSpecular],
-        ],
-        cullFace: gl.BACK,
-        depthTest: gl.LESS,
-        instanceCount: rocketCount,
-    }
-);
-*/
-
 // Skybox ----------------------------------------------------------------------
 const skyDrawCall = glance.createDrawCall(
     gl,
@@ -722,6 +726,25 @@ const skyDrawCall = glance.createDrawCall(
         depthTest: gl.LEQUAL,
     }
 );
+
+// Post ------------------------------------------------------------------------
+const postDrawCall = glance.createDrawCall(
+    gl,
+    postShader,
+    postVAO,
+    {
+        uniforms: {
+            u_time: (time) => time,
+        },
+        textures: [
+            [0, postColor],
+        ],
+        cullFace: gl.NONE,
+        depthTest: gl.NONE,
+    }
+);
+
+const framebufferStack = new glance.FramebufferStack();
 
 
 // =============================================================================
@@ -741,9 +764,6 @@ setRenderLoop((time) =>
     const avgDeltaTime = deltas.reduce((a, b) => a + b, 0) / deltas.length;
     //if (deltaPtr == 0) console.log(avgDeltaTime);
 
-
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
     if (panDelta != 0 || tiltDelta != 0) {
         viewPan += panDelta * .02;
         viewTilt += tiltDelta * .02;
@@ -759,14 +779,12 @@ setRenderLoop((time) =>
     for (let i = 0; i < bulletCount; i++) {
         // on start, set bullet position to player position
         if (flyingBullets == i){
-            // TODO: fix bullet position
-            bulletPosition[i][0] = PlayerX / 3.5;
-            bulletPosition[i][1] = PlayerY / 3.5;
+            bulletPosition[i][0] = PlayerX / 5;
+            bulletPosition[i][1] = PlayerY / 5 + .1;
         }
         if (shoot) {
             shoot = false;
             flyingBullets++;
-            
             console.log(shoot);
         }
         if (flyingBullets > i || bulletPosition[i][1] > -10) {
@@ -783,30 +801,22 @@ setRenderLoop((time) =>
     for (let i = 0; i < enemyCount; i++) {
         updateEnemyInstanceAttributes(i, 0, 0, time);
     }
-    //updateRocketInstanceAttributes(time);
 
+    // TODO: change post effect and toggle it when something relevant happens but i need collision detection first
+    if (postEffectOn) {framebufferStack.push(gl, postFramebuffer);}
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     glance.performDrawCall(gl, playerDrawCall, time);
     glance.performDrawCall(gl, enemyDrawCall, time);
     //glance.performDrawCall(gl, earthDrawCall, time);
-    //glance.performDrawCall(gl, rocketDrawCall, time);
     glance.performDrawCall(gl, bulletDrawCall, time);
-    glance.performDrawCall(gl, skyDrawCall, time);
-});
+    //glance.performDrawCall(gl, skyDrawCall, time);
 
-/*
-onMouseDrag((e) =>
-{
-    viewPan += e.movementX * -.01;
-    viewTilt += e.movementY * -.01;
-    viewRotationMatrix.setDirty();
+    if (postEffectOn){
+        framebufferStack.pop(gl);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        glance.performDrawCall(gl, postDrawCall, time);
+    }
 });
-
-onMouseWheel((e) =>
-{
-    viewDist = Math.max(1.5, Math.min(10, viewDist * (1 + Math.sign(e.deltaY) * 0.2)));
-    viewMatrix.setDirty();
-});
-*/
 
 
 onKeyDown((e) =>
@@ -837,6 +847,9 @@ onKeyDown((e) =>
             shootDelay();
         }
     }
+    if(e.key == "p"){
+        postEffectOn = true;
+    }
 });
 
 onKeyUp((e) =>
@@ -859,6 +872,9 @@ onKeyUp((e) =>
     }
     if (e.key == "Shift") {
         playerSpeed = fast;
+    }
+    if(e.key == "p"){
+        postEffectOn = false;
     }
 });
 
