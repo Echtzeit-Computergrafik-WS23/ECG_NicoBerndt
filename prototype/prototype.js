@@ -75,6 +75,46 @@ const {
 
 
 // =============================================================================
+// Audio
+// =============================================================================
+const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+const audioGain = audioContext.createGain();
+const audioAnalyser = audioContext.createAnalyser();
+audioGain.connect(audioAnalyser);
+audioAnalyser.connect(audioContext.destination);
+
+const shootSoundClip = './audio/pew.wav';
+const backgroundMusic = './audio/nierbackgroundmusic.wav';
+
+function playSoundClip(audioclip, volume, speed, loop_p = false) {
+    const audioSource = audioContext.createBufferSource();
+
+    const audioRequest = new XMLHttpRequest();
+    audioRequest.open('GET', audioclip, true);
+    audioRequest.responseType = 'arraybuffer';
+
+    audioRequest.onload = function() {
+        audioContext.decodeAudioData(audioRequest.response, function(buffer) {
+            audioSource.buffer = buffer;
+            audioSource.loop = loop_p;
+
+            // Adjust volume
+            audioGain.gain.setValueAtTime(volume, audioContext.currentTime);
+            
+
+            // Adjust speed
+            audioSource.playbackRate.setValueAtTime(speed, audioContext.currentTime);
+
+            audioSource.connect(audioGain);
+            audioSource.start(0);
+        });
+    };
+
+    audioRequest.send();
+}
+
+
+// =============================================================================
 // Shader Code
 // =============================================================================
 
@@ -555,6 +595,10 @@ const postFramebuffer = glance.createFramebuffer(gl, "framebuffer", postColor, p
 
 // Scene State
 let viewDist = 4.5;
+let viewPan = 0;
+let viewTilt = 0;
+let panDelta = 0;
+let tiltDelta = 0;
 let shoot = false;
 let shootDelayOver = true;
 let flyingBullets = 0;
@@ -755,15 +799,22 @@ let lastTime = 0;
 let deltas = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 let deltaPtr = 0;
 
+
+let start = true;
 setRenderLoop((time) =>
 {
+    if (start)  {
+        playSoundClip(backgroundMusic, .1, 1, true);
+        start = false;
+    }
+
     const deltaTime = time - lastTime;
     lastTime = time;
     deltas[deltaPtr] = deltaTime;
     deltaPtr = (deltaPtr + 1) % deltas.length;
     const avgDeltaTime = deltas.reduce((a, b) => a + b, 0) / deltas.length;
     //if (deltaPtr == 0) console.log(avgDeltaTime);
-
+    
     if (panDelta != 0 || tiltDelta != 0) {
         viewPan += panDelta * .02;
         viewTilt += tiltDelta * .02;
@@ -783,9 +834,11 @@ setRenderLoop((time) =>
             bulletPosition[i][1] = PlayerY / 5 + .1;
         }
         if (shoot) {
+            playSoundClip(shootSoundClip ,.1, 1);
             shoot = false;
             flyingBullets++;
             console.log(shoot);
+            
         }
         if (flyingBullets > i || bulletPosition[i][1] > -10) {
             updateBulletInstanceAttributes(i, bulletPosition[i][0], bulletPosition[i][1]);
@@ -839,8 +892,9 @@ onKeyDown((e) =>
     }
     if (e.key == "Shift") {
         playerSpeed = slow;
+        postEffectOn = true;
     }
-    if (e.key == "x" && shootDelayOver){
+    if ((e.key == "x" && shootDelayOver) || (e.key == "X" && shootDelayOver)){
         shoot = true;
         if (shootDelayOver){
             shootDelayOver = false;
@@ -848,7 +902,7 @@ onKeyDown((e) =>
         }
     }
     if(e.key == "p"){
-        postEffectOn = true;
+        
     }
 });
 
@@ -872,9 +926,10 @@ onKeyUp((e) =>
     }
     if (e.key == "Shift") {
         playerSpeed = fast;
+        postEffectOn = false;
     }
     if(e.key == "p"){
-        postEffectOn = false;
+        
     }
 });
 
