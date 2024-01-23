@@ -84,7 +84,7 @@ audioGain.connect(audioAnalyser);
 audioAnalyser.connect(audioContext.destination);
 
 const shootSoundClip = './audio/pew.wav';
-const backgroundMusic = './audio/nierbackgroundmusic.wav';
+const backgroundMusic = './audio/alienManifestation.wav';
 
 function playSoundClip(audioclip, volume, speed, loop_p = false) {
     const audioSource = audioContext.createBufferSource();
@@ -213,6 +213,89 @@ const phongFragmentShader = `#version 300 es
     }
 `;
 
+const phongVertexShaderWithNormalMapping = `#version 300 es
+    precision highp float;
+    
+    uniform mat4 u_modelMatrix;
+    uniform mat3 u_normalMatrix;
+    uniform mat4 u_viewMatrix;
+    uniform mat4 u_projectionMatrix;
+    uniform vec3 u_lightPos;
+    uniform vec3 u_viewPos;
+
+    in mat4 a_modelMatrix;
+    in vec3 a_pos;
+    in vec3 a_normal;
+    in vec3 a_tangent;
+    in mat3 a_normalMatrix;
+    in vec2 a_texCoord;
+
+    out vec3 f_worldPos;
+    out vec3 f_lightPos;
+    out vec3 f_viewPos;
+    out vec2 f_texCoord;
+
+    void main() {
+        vec3 normal = a_normalMatrix * a_normal;
+        vec3 tangent = a_normalMatrix * a_tangent;
+        vec3 bitangent = cross(normal, tangent);
+        mat3 tbn = transpose(mat3(tangent, bitangent, normal));
+
+        // Transform world space coords to tangent space
+        f_worldPos = tbn * vec3(a_modelMatrix * vec4(a_pos, 1.0));
+        f_lightPos = tbn * u_lightPos;
+        f_viewPos = tbn * u_viewPos;
+
+        f_texCoord = a_texCoord;
+
+        gl_Position = u_projectionMatrix * u_viewMatrix * a_modelMatrix * vec4(a_pos, 1.0);
+    }
+`;
+
+const phongFragmentShaderWithNormalMapping = `#version 300 es
+    precision mediump float;
+    
+    uniform float u_ambient;
+    uniform float u_specular;
+    uniform float u_shininess;
+    uniform vec3 u_lightColor;
+    uniform sampler2D u_texDiffuse;
+    uniform sampler2D u_texSpecular;
+    uniform sampler2D u_texNormal;
+
+    in vec3 f_worldPos;
+    in vec3 f_lightPos;
+    in vec3 f_viewPos;
+    in vec2 f_texCoord;
+
+    out vec4 FragColor;
+
+    void main() {
+
+        // texture
+        vec3 texDiffuse = texture(u_texDiffuse, f_texCoord).rgb;
+        vec3 texSpecular = texture(u_texSpecular, f_texCoord).rgb;
+        vec3 texNormal = texture(u_texNormal, f_texCoord).rgb;
+
+        // ambient
+        vec3 ambient = texDiffuse * u_ambient;
+
+        // diffuse
+        vec3 normal = normalize(texNormal * (255./128.) - 1.0);
+        vec3 lightDir = normalize(f_lightPos - f_worldPos);
+        float diffuseIntensity = max(dot(normal, lightDir), 0.0);
+        vec3 diffuse = diffuseIntensity * u_lightColor * texDiffuse;
+
+        // specular
+        vec3 viewDir = normalize(f_viewPos - f_worldPos);
+        vec3 halfWay = normalize(lightDir + viewDir);
+        float specularIntensity = pow(max(dot(normal, halfWay), 0.0), u_shininess);
+        vec3 specular = (u_specular * specularIntensity) * texSpecular * u_lightColor;
+
+        // color
+        FragColor = vec4(ambient + diffuse + specular, 1.0);
+    }
+`;
 
 const skyVertexShader = `#version 300 es
     precision highp float;
@@ -272,6 +355,7 @@ const postFragmentShader = `#version 300 es
 
     uniform sampler2D u_texture;
     uniform float u_time;
+    uniform vec2 u_resolution;
 
     in vec2 f_texCoord;
 
@@ -303,16 +387,16 @@ const postFragmentShader = `#version 300 es
         return color;
     }
 
-    const float sharpenKernel[9] = float[](
-        -1., -1., -1.,
-        -1.,  9., -1.,
-        -1., -1., -1.
+    const float sobelXKernel[9] = float[](
+        -1., 0., 1.,
+        -2., 0., 2.,
+        -1., 0., 1.
     );
 
-    const float blurKernel[9] = float[](
-        1./ 16., 2./16., 1./16.,
-        2./ 16., 4./16., 2./16.,
-        1./ 16., 2./16., 1./16.
+    const float sobelYKernel[9] = float[](
+        -1., -2., -1.,
+        0., 0., 0.,
+        1., 2., 1.
     );
 
     const float grainStrength = 65.0;
@@ -320,18 +404,15 @@ const postFragmentShader = `#version 300 es
     void main() {
         vec2 uv = gl_FragCoord.xy / vec2(512.0, 512.0);
         float x = (uv.x + 4.0 ) * (uv.y + 4.0 ) * (mod(u_time, 10000.));
-        float grain = 1.0 - ((mod((mod(x, 13.0) + 1.0) * (mod(x, 123.0) + 1.0), 0.01)-0.005) * grainStrength);
 
         vec3 color = texture(u_texture, f_texCoord).rgb;
-        vec3 blurred = applyKernel(u_texture, f_texCoord, blurKernel, 1.0 / 400.0);
-        vec3 sharpened = applyKernel(u_texture, f_texCoord, sharpenKernel, 1.0 / 400.0);
+        vec3 sobelX = applyKernel(u_texture, f_texCoord, sobelXKernel, 1.0 / 100.0);
+        vec3 sobelY = applyKernel(u_texture, f_texCoord, sobelYKernel, 1.0 / 100.0);
 
-        color = mix(color, sharpened, 1.0);
-        color = mix(color, blurred, .7);
-        color = greyscale(color);
-        color = color * grain;
+        color = mix(color, sobelX, .1);
+        color = mix(color, sobelY, .1);
 
-        FragColor = vec4(color, 1.0);
+        FragColor = vec4(color.x *.5, color.y * 1.0, color.z * .5, 1.0);
     }
 `;
 
@@ -340,7 +421,7 @@ const postFragmentShader = `#version 300 es
 // Variables
 // =============================================================================
 
-const projectionMatrix = mat4.perspective(Math.PI / 4, 1, 0.1, 14);
+const projectionMatrix = mat4.perspective(Math.PI / 4, 1, 0.1, 100);
 
 const bulletScale = 0.05;
 let bulletSpeed = 0.005;
@@ -351,11 +432,13 @@ const enemyScale = 0.3;
 const enemyDistance = 5;
 const enemySpeed = 0.0002;
 
+const groundCount = 1;
+
 const phongShader = glance.buildShaderProgram(gl, "phong-shader", phongVertexShader, phongFragmentShader, {
     u_ambient: 0.1,
     u_specular: 0.6,
     u_shininess: 64,
-    u_lightPos: [0, 0, 5],
+    u_lightPos: [0, -100, 50],
     u_lightColor: [1, 1, 1],
     u_projectionMatrix: projectionMatrix,
     u_texAmbient: 0,
@@ -367,13 +450,59 @@ const instancedPhongShader = glance.buildShaderProgram(gl, "enemy-shader", insta
     u_ambient: 0.1,
     u_specular: 0.6,
     u_shininess: 64,
-    u_lightPos: [0, 0, 5],
+    u_lightPos: [0, -100, 50],
     u_lightColor: [1, 1, 1],
     u_projectionMatrix: projectionMatrix,
     u_texAmbient: 0,
     u_texDiffuse: 1,
     u_texSpecular: 2,
 });
+
+const phongShaderWithNormalMapping = glance.buildShaderProgram(gl, "phong-shader-normals", phongVertexShaderWithNormalMapping, phongFragmentShaderWithNormalMapping, {
+    u_ambient: 0.1,
+    u_specular: 0.15,
+    u_shininess: 128,
+    u_lightPos: [0, -100, 50],
+    u_lightColor: [1, 1, 1],
+    u_projectionMatrix: projectionMatrix,
+    u_texDiffuse: 0,
+    u_texSpecular: 1,
+    u_texNormal: 2,
+});
+
+// Ground ----------------------------------------------------------------------
+const { attributes: groundAttr, indices: groundIdx } = await glance.loadObj("./obj/plane.obj");
+
+const groundIBO = glance.createIndexBuffer(gl, groundIdx);
+
+const groundABO = glance.createAttributeBuffer(gl, "ground-abo", groundAttr, {
+    a_pos: { size: 3, type: gl.FLOAT },
+    a_texCoord: { size: 2, type: gl.FLOAT },
+    a_normal: { size: 3, type: gl.FLOAT },
+});
+
+const tangentABO = glance.createAttributeBuffer(gl, "ground-tangent-abo",
+    Array().concat(...Array(4).fill([1, 0, 0])),
+    {
+        a_tangent: { size: 3, type: gl.FLOAT },
+    },
+);
+
+let groundInstanceAttributes = new Float32Array(groundCount * 25); // 16 + 9
+const groundIABO = glance.createAttributeBuffer(gl, "ground-iabo", groundInstanceAttributes, {
+    a_modelMatrix: { size: 4, width: 4, type: gl.FLOAT, divisor: 1 },
+    a_normalMatrix: { size: 3, width: 3, type: gl.FLOAT, divisor: 1 },
+});
+
+const groundVAO = glance.createVAO(
+    gl,
+    "ground-vao",
+    groundIBO,
+    glance.buildAttributeMap(phongShader, [groundABO, groundIABO, tangentABO]),
+);
+const groundTextureAmbient = await glance.loadTextureNow(gl, "./img/rock/rockAmbient.jpg");
+const groundTextureDiffuse = await glance.loadTextureNow(gl, "./img/rock/rockColor.jpg");
+const groundTextureSpecular = await glance.loadTextureNow(gl, "./img/rock/rockSpecular.png");
 
 // Player ----------------------------------------------------------------------
 const { attributes: playerAttr, indices: playerIdx } = await glance.loadObj("./obj/aircraft.obj");
@@ -392,9 +521,9 @@ const playerVAO = glance.createVAO(
     playerIBO,
     glance.buildAttributeMap(phongShader, playerABO),
 );
-const playerTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/Metal_ambient.jpg");
-const playerTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
-const playerTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/Metal_specular.png");
+const playerTextureAmbient = await glance.loadTextureNow(gl, "./img/player/playerAmbient.jpg");
+const playerTextureDiffuse = await glance.loadTextureNow(gl, "./img/player/playerColor.jpg");
+const playerTextureSpecular = await glance.loadTextureNow(gl, "./img/player/playerSpecular.png");
 
 // Enemy -----------------------------------------------------------------------
 const { attributes: enemyAttr, indices: enemyIdx } = await glance.loadObj("./obj/suzanne.obj");
@@ -422,9 +551,9 @@ const enemyVAO = glance.createVAO(
         glance.buildAttributeMap(instancedPhongShader, enemyIABO),
     ),
 );
-const enemyTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/Metal_ambient.jpg");
-const enemyTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
-const enemyTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
+const enemyTextureAmbient = await glance.loadTextureNow(gl, "./img/enemy/enemyAmbient.jpg");
+const enemyTextureDiffuse = await glance.loadTextureNow(gl, "./img/enemy/enemyColor.jpg");
+const enemyTextureSpecular = await glance.loadTextureNow(gl, "./img/enemy/enemySpecular.png");
 
 function updateEnemyInstanceAttributes(index, posX, posY, time) {
     const modelMatrix = mat4.multiply(
@@ -491,9 +620,9 @@ const bulletVAO = glance.createVAO(
         glance.buildAttributeMap(bulletShader, bulletIABO),
     ),
 );
-const bulletTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/Metal_ambient.jpg");
-const bulletTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
-const bulletTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/Metal_color.jpg");
+const bulletTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/bulletAmbient.jpg");
+const bulletTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/bulletColor.jpg");
+const bulletTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/bulletSpecular.png");
 
 function updateBulletInstanceAttributes(index, posX, posY) {
     const modelMatrix = mat4.multiply(
@@ -624,6 +753,12 @@ const earthModelMatrix = new glance.TimeSensitive(
     (time) => mat4.multiply(mat4.identity(), mat4.fromRotation(0.0002 * time, [0, 1, 0]))
 );
 
+// scale, rotate and translate, in that order
+const groundModelMatrix = new glance.TimeSensitive(
+    (time) => mat4.multiply(
+        mat4.fromScaling([20, 20, 20]),
+        mat4.fromTranslation([0, 0, -2]))
+);
 
 // Player State
 let slow = .05;
@@ -771,6 +906,28 @@ const skyDrawCall = glance.createDrawCall(
     }
 );
 
+// Ground ----------------------------------------------------------------------
+const groundDrawCall = glance.createDrawCall(
+    gl,
+    phongShader,
+    groundVAO,
+    {
+        uniforms: {
+            u_modelMatrix: (time) => groundModelMatrix.getAt(time),
+            u_normalMatrix: (time) => mat3.fromMat4(mat4.transpose(mat4.invert(groundModelMatrix.getAt(time)))),
+            u_viewMatrix: () => mat4.invert(viewMatrix.get()),
+            u_viewPos: () => vec3.transformMat4(vec3.zero(), viewMatrix.get()),
+        },
+        textures: [
+            [0, groundTextureAmbient],
+            [1, groundTextureDiffuse],
+            [2, groundTextureSpecular],
+        ],
+        cullFace: gl.BACK,
+        depthTest: gl.LESS,
+    }
+);
+
 // Post ------------------------------------------------------------------------
 const postDrawCall = glance.createDrawCall(
     gl,
@@ -804,7 +961,7 @@ let start = true;
 setRenderLoop((time) =>
 {
     if (start)  {
-        playSoundClip(backgroundMusic, .1, 1, true);
+        //playSoundClip(backgroundMusic, .1, 1, true);
         start = false;
     }
 
@@ -862,6 +1019,8 @@ setRenderLoop((time) =>
     glance.performDrawCall(gl, enemyDrawCall, time);
     //glance.performDrawCall(gl, earthDrawCall, time);
     glance.performDrawCall(gl, bulletDrawCall, time);
+    glance.performDrawCall(gl, groundDrawCall, time);
+    //glance.performDrawCall(gl, bulbDrawCall, time);
     //glance.performDrawCall(gl, skyDrawCall, time);
 
     if (postEffectOn){
