@@ -423,12 +423,12 @@ const postFragmentShader = `#version 300 es
 
 const projectionMatrix = mat4.perspective(Math.PI / 4, 1, 0.1, 100);
 
-const bulletScale = 0.05;
 let bulletSpeed = 0.005;
-let bulletCount = 20;
+let playerBullets = 20;
+let enemyBullets = 20;
 
-const enemyCount = 6;
-const enemyScale = 0.3;
+const enemyCount = 1;
+let enemyScale = .8;
 const enemyDistance = 5;
 const enemySpeed = 0.0002;
 
@@ -557,6 +557,14 @@ const enemyTextureSpecular = await glance.loadTextureNow(gl, "./img/enemy/enemyS
 
 function updateEnemyInstanceAttributes(index, posX, posY, time) {
     const modelMatrix = mat4.multiply(
+        mat4.fromScaling(enemyScale),
+        mat4.multiply(
+            mat4.fromRotation(Math.PI * .3, [1, 0, 0]),
+            mat4.fromTranslation([posX, 2, 0]), // translate to position
+        )
+
+    );
+    /*const modelMatrix = mat4.multiply(
         mat4.fromRotation(index + enemySpeed * time, [0, 0, 1]),
             mat4.multiply(
                 mat4.fromTranslation([-enemyDistance, 0, 0]),
@@ -568,7 +576,7 @@ function updateEnemyInstanceAttributes(index, posX, posY, time) {
                 )
             )
         ),
-    );
+    );*/
 
     const arrayOffset = index * 25;
     enemyInstanceAttributes.set(modelMatrix, arrayOffset);
@@ -605,7 +613,7 @@ const bulletABO = glance.createAttributeBuffer(gl, "bullet-abo", bulletAttr, {
     a_normal: { size: 3, type: gl.FLOAT },
 });
 
-let bulletInstanceAttributes = new Float32Array(bulletCount * 25); // 16 + 9
+let bulletInstanceAttributes = new Float32Array((playerBullets + enemyBullets) * 25); // 16 + 9
 const bulletIABO = glance.createAttributeBuffer(gl, "bullet-iabo", bulletInstanceAttributes, {
     a_modelMatrix: { size: 4, width: 4, type: gl.FLOAT, divisor: 1 },
     a_normalMatrix: { size: 3, width: 3, type: gl.FLOAT, divisor: 1 },
@@ -624,7 +632,7 @@ const bulletTextureAmbient = await glance.loadTextureNow(gl, "./img/bullets/bull
 const bulletTextureDiffuse = await glance.loadTextureNow(gl, "./img/bullets/bulletColor.jpg");
 const bulletTextureSpecular = await glance.loadTextureNow(gl, "./img/bullets/bulletSpecular.png");
 
-function updateBulletInstanceAttributes(index, posX, posY) {
+function updateBulletInstanceAttributes(index, posX, posY, bulletScale = 0.05) {
     const modelMatrix = mat4.multiply(
         mat4.fromTranslation([posX, posY, 0]),
         mat4.fromScaling(bulletScale),
@@ -639,7 +647,6 @@ function updateBulletInstanceAttributes(index, posX, posY) {
     gl.bufferSubData(gl.ARRAY_BUFFER, arrayOffset * 4, bulletInstanceAttributes.subarray(arrayOffset, arrayOffset + 25));
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, null);
 }
-
 
 
 // Earth -----------------------------------------------------------------------
@@ -729,9 +736,14 @@ let viewTilt = 0;
 let panDelta = 0;
 let tiltDelta = 0;
 let shoot = false;
+let shoot_e = false;
 let shootDelayOver = true;
-let flyingBullets = 0;
+let flyingBullets_p = 0;
+let flyingBullets_e = 0;
 let postEffectOn = false;
+let enemyHit = false;
+let hitCount = 0;
+let youWon = false;
 
 const viewRotationMatrix = new glance.Cached(
     () =>
@@ -845,6 +857,26 @@ let bulletPosition = [
     [0, -10],
     [0, -10],
     [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10],
+    [0, -10], // 40
 ];
 
 const bulletDrawCall = glance.createDrawCall(
@@ -863,7 +895,7 @@ const bulletDrawCall = glance.createDrawCall(
         ],
         cullFace: gl.BACK,
         depthTest: gl.LESS,
-        instanceCount: bulletCount,
+        instanceCount: playerBullets + enemyBullets,
     }
 );
 
@@ -963,6 +995,8 @@ setRenderLoop((time) =>
     if (start)  {
         //playSoundClip(backgroundMusic, .1, 1, true);
         start = false;
+        shoot_e = true;
+        shootDelay_e();
     }
 
     const deltaTime = time - lastTime;
@@ -984,49 +1018,91 @@ setRenderLoop((time) =>
         playerModelMatrix.setDirty();
     }
 
-    for (let i = 0; i < bulletCount; i++) {
+    //playerbullets
+    for (let i = 0; i < playerBullets; i++) {
         // on start, set bullet position to player position
-        if (flyingBullets == i){
+        if (flyingBullets_p == i){
             bulletPosition[i][0] = PlayerX / 5;
             bulletPosition[i][1] = PlayerY / 5 + .1;
         }
-        if (shoot) {
+        if (shoot && !youWon) {
             playSoundClip(shootSoundClip ,.1, 1);
             shoot = false;
-            flyingBullets++;
-            console.log(shoot);
+            flyingBullets_p++;
             
         }
-        if (flyingBullets > i || bulletPosition[i][1] > -10) {
-            updateBulletInstanceAttributes(i, bulletPosition[i][0], bulletPosition[i][1]);
-            console.log("flying bullets: ", flyingBullets);
+        if (flyingBullets_p > i || bulletPosition[i][1] > -10) {
+            bulletPosition[i][0] += (Math.random()*2 - 1)/40;
             bulletPosition[i][1] += bulletSpeed * avgDeltaTime;
+            updateBulletInstanceAttributes(i, bulletPosition[i][0], bulletPosition[i][1], 0.05);
         }
-        if (flyingBullets == bulletCount) {
-            flyingBullets = 0;
+        if (flyingBullets_p == playerBullets) {
+            flyingBullets_p = 0;
+        }
+        // enemy hit detection
+        if (bulletPosition[i][1] > 1 && bulletPosition[i][1] < 1.2 && bulletPosition[i][0] > -0.8 && bulletPosition[i][0] < 0.8 && !enemyHit) {
+            enemyHit = true;
+            hitCount++;
+            postEffectDelay();
+        }
+    }
+
+    //enemybullets
+    for (let i = playerBullets; i < playerBullets + enemyBullets; i+=2) {
+        // on start, set bullet position to enemy position
+        if (flyingBullets_e == i - playerBullets){
+            bulletPosition[i][0] = Math.sin(time*.001)/4;
+            bulletPosition[i][1] = 1.1;
+            bulletPosition[i+1][0] = Math.sin(time*.001)/4;
+            bulletPosition[i+1][1] = 1.1;
+        }
+        if (shoot_e && !youWon) {
+            playSoundClip(shootSoundClip ,.1, 1);
+            shoot_e = false;
+            flyingBullets_e+=2;
+            console.log(shoot_e);
+            
+        }
+        if (flyingBullets_e > i || bulletPosition[i][1] > -10) {
+            // move bullets in wiggly line
+            bulletPosition[i][0] += bulletSpeed/3 * avgDeltaTime * Math.sin(time*.0025);
+            bulletPosition[i][1] -= bulletSpeed/3 * avgDeltaTime;
+            bulletPosition[i+1][0] += bulletSpeed/4 * avgDeltaTime * Math.cos(time*.0025);
+            bulletPosition[i+1][1] -= bulletSpeed/4 * avgDeltaTime;
+            updateBulletInstanceAttributes(i, bulletPosition[i][0], bulletPosition[i][1], .2);
+            updateBulletInstanceAttributes(i+1, bulletPosition[i+1][0], bulletPosition[i+1][1], .2);
+        }
+        if (flyingBullets_e == enemyBullets) {
+            flyingBullets_e = 0;
         }
     }
 
     
     for (let i = 0; i < enemyCount; i++) {
-        updateEnemyInstanceAttributes(i, 0, 0, time);
+        updateEnemyInstanceAttributes(i, Math.sin(time*.001)/4, 0, time);
     }
 
-    // TODO: change post effect and toggle it when something relevant happens but i need collision detection first
     if (postEffectOn) {framebufferStack.push(gl, postFramebuffer);}
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     glance.performDrawCall(gl, playerDrawCall, time);
-    glance.performDrawCall(gl, enemyDrawCall, time);
-    //glance.performDrawCall(gl, earthDrawCall, time);
-    glance.performDrawCall(gl, bulletDrawCall, time);
+    if (!youWon){
+        glance.performDrawCall(gl, enemyDrawCall, time);
+        glance.performDrawCall(gl, bulletDrawCall, time);
+    }
     glance.performDrawCall(gl, groundDrawCall, time);
-    //glance.performDrawCall(gl, bulbDrawCall, time);
-    //glance.performDrawCall(gl, skyDrawCall, time);
 
     if (postEffectOn){
         framebufferStack.pop(gl);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         glance.performDrawCall(gl, postDrawCall, time);
+    }
+
+    if (hitCount > 10){
+        enemyScale -= .001 * avgDeltaTime;
+        if (enemyScale < 0){
+            youWon = true;
+            console.log("you win");
+        }
     }
 });
 
@@ -1101,5 +1177,17 @@ async function shootDelay() {
     await delay(100);
     shootDelayOver = true;
 }
-  
-  
+
+async function shootDelay_e() {
+    await delay(1500);
+    shoot_e = true;
+    shootDelay_e();
+}
+
+//TODO: make second post effect
+async function postEffectDelay() {
+    postEffectOn = true;
+    await delay(50);
+    postEffectOn = false;
+    enemyHit = false;
+} 
