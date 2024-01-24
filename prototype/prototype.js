@@ -485,7 +485,6 @@ const secondPostFragmentShader = `#version 300 es
 
     void main() {
         vec2 uv = gl_FragCoord.xy / vec2(512.0, 512.0) * 2.0 - 1.0;
-        // move the center of the screen to (0, 1)
         uv.y *= +1000.0;
 
         vec3 color = texture(u_texture, f_texCoord).rgb;
