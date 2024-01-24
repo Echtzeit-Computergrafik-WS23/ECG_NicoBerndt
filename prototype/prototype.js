@@ -85,6 +85,9 @@ audioAnalyser.connect(audioContext.destination);
 
 const shootSoundClip = './audio/pew.wav';
 const backgroundMusic = './audio/alienManifestation.wav';
+const hitSoundClip = './audio/enemyHit.wav';
+const gameWonSoundClip = './audio/enemyDefeated.wav';
+const enemyShootSoundClip = './audio/enemyShoot.wav';
 
 function playSoundClip(audioclip, volume, speed, loop_p = false) {
     const audioSource = audioContext.createBufferSource();
@@ -416,6 +419,93 @@ const postFragmentShader = `#version 300 es
     }
 `;
 
+const secondPostVertexShader = `#version 300 es
+    precision highp float;
+
+    in vec2 a_pos;
+    in vec2 a_texCoord;
+
+    out vec2 f_texCoord;
+
+    void main()
+    {
+        f_texCoord = a_texCoord;
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+    }
+`;
+
+const secondPostFragmentShader = `#version 300 es
+    precision mediump float;
+
+    uniform sampler2D u_texture;
+    uniform float u_time;
+    uniform vec2 u_resolution;
+
+    in vec2 f_texCoord;
+
+    out vec4 FragColor;
+
+    vec3 greyscale(vec3 color)
+    {
+        return vec3(0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b);
+    }
+
+    vec3 applyKernel(sampler2D image, vec2 uv, float kernel[9], float offset)
+    {
+        const vec2 offsets[9] = vec2[](
+            vec2(-1,  1), // top-left
+            vec2( 0,  1), // top-center
+            vec2( 1,  1), // top-right
+            vec2(-1,  0), // center-left
+            vec2( 0,  0), // center-center
+            vec2( 1,  0), // center-right
+            vec2(-1, -1), // bottom-left
+            vec2( 0, -1), // bottom-center
+            vec2( 1, -1)  // bottom-right
+        );
+
+        vec3 color = vec3(0.0);
+        for(int i = 0; i < 9; i++) {
+            color += texture(image, uv + offsets[i] * offset).rgb * kernel[i];
+        }
+        return color;
+    }
+
+    const float sharpenKernel[9] = float[](
+        -1., -1., -1.,
+        -1.,  9., -1.,
+        -1., -1., -1.
+    );
+
+    const float blurKernel[9] = float[](
+        1./ 16., 2./16., 1./16.,
+        2./ 16., 4./16., 2./16.,
+        1./ 16., 2./16., 1./16.
+    );
+
+    void main() {
+        vec2 uv = gl_FragCoord.xy / vec2(512.0, 512.0) * 2.0 - 1.0;
+        // move the center of the screen to (0, 1)
+        uv.y *= +1000.0;
+
+        vec3 color = texture(u_texture, f_texCoord).rgb;
+        vec3 sharpen = applyKernel(u_texture, f_texCoord, sharpenKernel, 1.0 / 1000.0);
+
+        color = mix(color, sharpen, 1.0);
+
+        float d = length(uv);
+            
+        d = sin(10.0*d - .01*u_time)/15.0;
+        d = abs(d);
+        d = smoothstep(0.0, 0.1, d);
+        d = pow(.01 / d, 1.2);
+            
+        color += d/40.0;
+
+        FragColor = vec4(color.x *.5, color.y * .5, color.z * 1.0, 1.0);
+    }
+`;
+
 
 // =============================================================================
 // Variables
@@ -709,6 +799,21 @@ const postABO = glance.createAttributeBuffer(gl, "post-abo", glance.createQuadAt
 const postVAO = glance.createVAO(gl, "post-vao", postIBO, glance.buildAttributeMap(postShader, postABO));
 
 
+// Second Post -----------------------------------------------------------------
+const secondPostShader = glance.buildShaderProgram(gl, "second-post-shader", secondPostVertexShader, secondPostFragmentShader, {
+    u_texture: 0,
+});
+
+const secondPostIBO = glance.createIndexBuffer(gl, glance.createQuadIndices());
+
+const secondPostABO = glance.createAttributeBuffer(gl, "second-post-abo", glance.createQuadAttributes(), {
+    a_pos: { size: 2, type: gl.FLOAT },
+    a_texCoord: { size: 2, type: gl.FLOAT },
+});
+
+const secondPostVAO = glance.createVAO(gl, "second-post-vao", secondPostIBO, glance.buildAttributeMap(secondPostShader, secondPostABO));
+
+
 // =============================================================================
 // Framebuffer
 // =============================================================================
@@ -741,6 +846,7 @@ let shootDelayOver = true;
 let flyingBullets_p = 0;
 let flyingBullets_e = 0;
 let postEffectOn = false;
+let secondPostEffectOn = false;
 let enemyHit = false;
 let hitCount = 0;
 let youWon = false;
@@ -777,7 +883,7 @@ let slow = .05;
 let fast = .15;
 let playerSpeed = fast;
 let PlayerX = 0;
-let PlayerY = 0;
+let PlayerY = -5;
 let PlayerXDelta = 0;
 let PlayerYDelta = 0;
 
@@ -979,6 +1085,23 @@ const postDrawCall = glance.createDrawCall(
 
 const framebufferStack = new glance.FramebufferStack();
 
+// Second Post -----------------------------------------------------------------
+const secondPostDrawCall = glance.createDrawCall(
+    gl,
+    secondPostShader,
+    secondPostVAO,
+    {
+        uniforms: {
+            u_time: (time) => time,
+        },
+        textures: [
+            [0, postColor],
+        ],
+        cullFace: gl.NONE,
+        depthTest: gl.NONE,
+    }
+);
+
 
 // =============================================================================
 // System Integration
@@ -1057,7 +1180,7 @@ setRenderLoop((time) =>
             bulletPosition[i+1][1] = 1.1;
         }
         if (shoot_e && !youWon) {
-            playSoundClip(shootSoundClip ,.1, 1);
+            playSoundClip(enemyShootSoundClip ,.1, 1);
             shoot_e = false;
             flyingBullets_e+=2;
             console.log(shoot_e);
@@ -1083,6 +1206,8 @@ setRenderLoop((time) =>
     }
 
     if (postEffectOn) {framebufferStack.push(gl, postFramebuffer);}
+    if (secondPostEffectOn) {framebufferStack.push(gl, postFramebuffer);}
+
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     glance.performDrawCall(gl, playerDrawCall, time);
     if (!youWon){
@@ -1096,9 +1221,15 @@ setRenderLoop((time) =>
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
         glance.performDrawCall(gl, postDrawCall, time);
     }
+    if (secondPostEffectOn){
+        framebufferStack.pop(gl);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        glance.performDrawCall(gl, secondPostDrawCall, time);
+    }
 
-    if (hitCount > 10){
+    if (hitCount > 10 && !youWon){
         enemyScale -= .001 * avgDeltaTime;
+        playSoundClip(gameWonSoundClip ,.1, 1, false);
         if (enemyScale < 0){
             youWon = true;
             console.log("you win");
@@ -1137,7 +1268,7 @@ onKeyDown((e) =>
         }
     }
     if(e.key == "p"){
-        
+        secondPostEffectOn = true;
     }
 });
 
@@ -1164,7 +1295,7 @@ onKeyUp((e) =>
         postEffectOn = false;
     }
     if(e.key == "p"){
-        
+        secondPostEffectOn = false;
     }
 });
 
@@ -1186,8 +1317,9 @@ async function shootDelay_e() {
 
 //TODO: make second post effect
 async function postEffectDelay() {
-    postEffectOn = true;
-    await delay(50);
-    postEffectOn = false;
+    secondPostEffectOn = true;
+    playSoundClip(hitSoundClip ,.1, 1);
+    await delay(25);
+    secondPostEffectOn = false;
     enemyHit = false;
 } 
